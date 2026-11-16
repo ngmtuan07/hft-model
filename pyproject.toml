@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hftmodel"
+version = "0.1.0"
+description = "Avellaneda-Stoikov / Cont-Stoikov-Talreja market making, LOBSTER backtesting, FPGA golden model"
+requires-python = ">=3.10"
+dependencies = ["numpy", "numba", "pandas", "scipy", "matplotlib"]
+
+[project.optional-dependencies]
+hbt = ["hftbacktest>=2.4"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["hftmodel"]

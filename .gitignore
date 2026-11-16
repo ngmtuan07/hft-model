@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.egg-info/
+data/
+output/
+fpga/hls/tb
+.pytest_cache/
+fpga/hls/quote_engine_prj/
+fpga/vivado/kv260_qe/
+fpga/vivado/overlay/
+*.log
+.DS_Store
+.claude/
