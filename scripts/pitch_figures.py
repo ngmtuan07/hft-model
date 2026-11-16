@@ -24,7 +24,8 @@ from hftmodel import backtest as bt  # noqa: E402
 from hftmodel import calibration, lobster, metrics, strategy  # noqa: E402
 
 BLUE, ORANGE, AQUA, YELLOW, GRAY, INK = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#52514e", "#0b0b0b"
-REBATE = -0.002   # assumed maker rebate $/share (2012 NASDAQ order of magnitude; tier-dependent)
+REBATE = -0.002
+DECK = False      # --deck: larger text, no figure titles (the slide heading carries them)   # assumed maker rebate $/share (2012 NASDAQ order of magnitude; tier-dependent)
 
 
 def style():
@@ -36,6 +37,8 @@ def style():
                          "axes.labelcolor": GRAY, "xtick.color": GRAY, "ytick.color": GRAY, "text.color": INK,
                          "figure.facecolor": "#fcfcfb", "axes.facecolor": "#fcfcfb", "font.size": 10,
                          "axes.titlesize": 11, "legend.frameon": False})
+    if DECK:
+        plt.rcParams.update({"font.size": 13, "axes.titlesize": 14, "legend.fontsize": 12})
     return plt
 
 
@@ -58,7 +61,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/lobster")
     ap.add_argument("--out", default="output/pitch")
+    ap.add_argument("--deck", action="store_true", help="slide versions: bigger text, no figure titles")
     a = ap.parse_args()
+    global DECK
+    DECK = a.deck
     os.makedirs(a.out, exist_ok=True)
     plt = style()
     stocks = {T: setup(a.data, T) for T in ("INTC", "MSFT")}
@@ -93,20 +99,22 @@ def main():
         ax2[col].bar(x - 0.2, pnl_g, 0.38, color=GRAY, label="no rebate")
         ax2[col].bar(x + 0.2, pnl_r, 0.38, color=BLUE, label=f"with ${-REBATE:.3f}/share maker rebate (assumed)")
         for xi, v in zip(x - 0.2, pnl_g):
-            ax2[col].text(xi, v, f"{v:,.0f}", ha="center", va="top" if v < 0 else "bottom", fontsize=8, color=INK)
+            ax2[col].text(xi, v, f"{v:,.0f}", ha="center", va="top" if v < 0 else "bottom", fontsize=11 if DECK else 8, color=INK)
         for xi, v in zip(x + 0.2, pnl_r):
-            ax2[col].text(xi, v, f"{v:,.0f}", ha="center", va="top" if v < 0 else "bottom", fontsize=8, color=INK)
+            ax2[col].text(xi, v, f"{v:,.0f}", ha="center", va="top" if v < 0 else "bottom", fontsize=11 if DECK else 8, color=INK)
         ax2[col].axhline(0, color=GRAY, lw=0.8)
         ax2[col].set_xticks(x, [v[0] for v in variants], fontsize=8)
         ax2[col].set_title(f"{T}: PnL, 13:15–15:55 (out of sample)", loc="left")
     ax1[0].set_ylabel("ticks earned per share (vs mid)")
     ax1[0].legend(loc="lower left")
-    fig1.suptitle("You earn half the spread at the fill — then the price moves against you", x=0.01, ha="left")
+    if not DECK:
+        fig1.suptitle("You earn half the spread at the fill — then the price moves against you", x=0.01, ha="left")
     fig1.tight_layout()
     fig1.savefig(os.path.join(a.out, "fig1_adverse_selection.png"), dpi=150)
     ax2[0].set_ylabel("PnL ($), 100-share quotes")
     ax2[0].legend(loc="lower left", fontsize=8)
-    fig2.suptitle("Same prices, different place in line: being first is the edge", x=0.01, ha="left")
+    if not DECK:
+        fig2.suptitle("Same prices, different place in line: being first is the edge", x=0.01, ha="left")
     fig2.tight_layout()
     fig2.savefig(os.path.join(a.out, "fig2_queue_priority.png"), dpi=150)
 
@@ -133,7 +141,8 @@ def main():
         ax.axvspan(0.5, 10, color="#cde2fb", alpha=0.5, lw=0)
         ax.legend()
     ax3[0].text(1.2, 25, "FPGA\nterritory", color=BLUE, fontsize=9)
-    fig3.suptitle("Why HFT firms buy speed: queue position is decided in microseconds", x=0.01, ha="left")
+    if not DECK:
+        fig3.suptitle("Why HFT firms buy speed: queue position is decided in microseconds", x=0.01, ha="left")
     fig3.tight_layout()
     fig3.savefig(os.path.join(a.out, "fig3_speed.png"), dpi=150)
 
@@ -163,7 +172,8 @@ def main():
         ax4[1].set_ylabel("stock's move in the same direction (bps)")
         ax4[1].set_title("SPY moves first; its members follow within milliseconds", loc="left")
         ax4[1].legend()
-    fig4.suptitle("Signals that tell a market maker when to step back", x=0.01, ha="left")
+    if not DECK:
+        fig4.suptitle("Signals that tell a market maker when to step back", x=0.01, ha="left")
     fig4.tight_layout()
     fig4.savefig(os.path.join(a.out, "fig4_signals.png"), dpi=150)
 
