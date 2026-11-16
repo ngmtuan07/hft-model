@@ -34,6 +34,8 @@ class BacktestConfig:
     feed_latency_ns: int = 50_000     # market data latency (exchange -> strategy)
     order_latency_ns: int = 50_000    # order entry latency (strategy -> exchange)
     min_requote_ns: int = 0           # throttle between quote updates
+    join_queue: bool = True           # False: only post where the visible queue is empty (we are first);
+                                      # existing orders are kept instead of rejoining at the back
     keep_behind_ticks: int = 0        # keep a resting order up to this many ticks *behind* the desired
                                       # price (retains queue priority); more aggressive -> always replace
     queue_power: float = 3.0          # n in the probabilistic queue model
@@ -64,8 +66,8 @@ def _prob_ahead(a, b, n):
 @njit(cache=True)
 def _run(ts, typ, size, price, dirn, ask_px, ask_sz, bid_px, bid_sz, tick,
          kernel, fp, ip, lut_f, lut_i,
-         qty, feed_lat, order_lat, min_requote, keep_behind, qpow, fee,
-         rec_interval, sigma_alpha, sigma0):
+         qty, feed_lat, order_lat, min_requote, keep_behind, join_q, qpow, fee,
+         rec_interval, sigma_alpha, sigma0, ext):
     n = ts.shape[0]
     # live orders
     b_live, b_px, b_rem, b_ahead = False, 0, 0, 0.0
@@ -254,11 +256,24 @@ def _run(ts, typ, size, price, dirn, ask_px, ask_sz, bid_px, bid_sz, tick,
         inv_lots = int(round(position / qty))
         qb, qa = kernel(t, bb // tick, ba // tick, bid_sz[i, 0], ask_sz[i, 0], inv_lots,
                         np.sqrt(var), fp, ip, lut_f, lut_i)
+        # external signal known at this row (e.g. SPY just moved): -1 pulls the bid, +1 the ask
+        if ext[i] < 0:
+            qb = -1
+        elif ext[i] > 0:
+            qa = -1
         want_b = qb * tick if qb >= 0 else -1
         want_a = qa * tick if qa >= 0 else -1
         arrive = t + feed_lat + order_lat
         work_b = b_pend_px if b_pend else (b_px if b_live else -1)
         work_a = a_pend_px if a_pend else (a_px if a_live else -1)
+        if not join_q:
+            # queue-priority mode: never join the back of an existing queue. If the wanted price
+            # already has visible size, keep a less aggressive resting order (it keeps its
+            # priority) or do nothing; a more aggressive one is cancelled for risk.
+            if want_b >= 0 and want_b != work_b and _qty_at(bid_px[i], bid_sz[i], want_b) > 0:
+                want_b = work_b if (work_b >= 0 and work_b < want_b) else -1
+            if want_a >= 0 and want_a != work_a and _qty_at(ask_px[i], ask_sz[i], want_a) > 0:
+                want_a = work_a if (work_a >= 0 and work_a > want_a) else -1
         changed = False
         if (want_b < 0) != (work_b < 0) or (want_b >= 0 and (work_b > want_b or want_b - work_b > keep_behind * tick)):
             if want_b < 0 or b_live:
@@ -309,8 +324,15 @@ class BacktestResult:
 
 def run(day: LobsterDay, kernel, fp: np.ndarray, ip: np.ndarray | None = None,
         lut_f: np.ndarray | None = None, lut_i: np.ndarray | None = None,
-        cfg: BacktestConfig | None = None) -> BacktestResult:
+        cfg: BacktestConfig | None = None, ext: np.ndarray | None = None) -> BacktestResult:
+    """Replays ``day`` through a quote kernel.
+
+    ``ext`` (optional, int8 per row): an external defensive signal observed at that row's
+    time. -1 cancels/suppresses the bid, +1 the ask (see :mod:`hftmodel.signals`). Rows with
+    message type 0 are signal-only rows that carry the previous book and trigger no fills.
+    """
     cfg = cfg or BacktestConfig()
+    ext = np.zeros(len(day), np.int8) if ext is None else ext.astype(np.int8)
     ip = np.zeros(1, np.int64) if ip is None else ip
     lut_f = np.full((2, 2), 0.5) if lut_f is None else lut_f
     lut_i = np.zeros((2, 2), np.int64) if lut_i is None else lut_i
@@ -318,8 +340,8 @@ def run(day: LobsterDay, kernel, fp: np.ndarray, ip: np.ndarray | None = None,
     out = _run(day.ts, day.type, day.size, day.price, day.direction,
                day.ask_px, day.ask_sz, day.bid_px, day.bid_sz, day.tick,
                kernel, fp.astype(np.float64), ip.astype(np.int64), lut_f.astype(np.float64), lut_i.astype(np.int64),
-               cfg.order_qty, cfg.feed_latency_ns, cfg.order_latency_ns, cfg.min_requote_ns, cfg.keep_behind_ticks,
-               cfg.queue_power, cfg.maker_fee, cfg.record_interval_ns, alpha, cfg.sigma0)
+               cfg.order_qty, cfg.feed_latency_ns, cfg.order_latency_ns, cfg.min_requote_ns, cfg.keep_behind_ticks, cfg.join_queue,
+               cfg.queue_power, cfg.maker_fee, cfg.record_interval_ns, alpha, cfg.sigma0, ext)
     stats = out[0]
     fills = dict(zip(["t", "side", "px", "qty", "mid", "reason", "ahead0", "age_ns", "bq", "aq", "spread"], out[1:12]))
     recs = dict(zip(["t", "mid", "pos", "cash", "bid", "ask", "sigma"], out[12:19]))

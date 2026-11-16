@@ -188,3 +188,32 @@ def fixed_point_params(p: ASParams, p_up: np.ndarray, frac: int = FX_FRAC):
         if not -(1 << 31) <= int(v) < (1 << 31):
             raise ValueError(f"{name}={v} does not fit in 32 bits; reduce gamma/tau/alpha")
     return ip, lut
+
+
+@njit(cache=True)
+def penny_quote(t_ns, bb, ba, bq, aq, inv, sigma, fp, ip, lut_f, lut_i):
+    """Spread-improvement ("first in the queue") quoting, for use with
+    ``BacktestConfig(join_queue=False)``.
+
+    * spread >= 3 ticks: improve both sides by one tick -> we are alone at the new best prices
+    * spread == 2 ticks: only one side can improve (the inside price is shared); improve the side
+      that reduces inventory, or when flat the side the queue imbalance favours
+    * spread == 1 tick : stay at the touch (the engine keeps an order we already have there but
+      never joins the back of the queue)
+    Inventory limit as in the A-S kernel (fp[F_MAX_POS]).
+    """
+    spread = ba - bb
+    bid, ask = bb, ba
+    if spread >= 3:
+        bid, ask = bb + 1, ba - 1
+    elif spread == 2:
+        buy_side = inv < 0 or (inv == 0 and bq >= aq)
+        if buy_side:
+            bid = bb + 1
+        else:
+            ask = ba - 1
+    if inv >= fp[F_MAX_POS]:
+        bid = -1
+    if inv <= -fp[F_MAX_POS]:
+        ask = -1
+    return bid, ask

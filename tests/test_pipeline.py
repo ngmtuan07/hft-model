@@ -92,3 +92,33 @@ def test_hftbacktest_conversion(day):
     data = hbt.convert(day.slice_time(day.ts[0], day.ts[0] + int(120e9)))
     validate_event_order(data)
     assert len(data) > 0
+
+
+def test_signal_rows_preserve_market_and_carry_book(day):
+    from hftmodel import signals
+    d = day.slice_time(day.ts[0], day.ts[0] + int(60e9))
+    trig_t = d.ts[[100, 500, 900]] + 1000
+    trig_d = np.array([1, -1, 1], np.int8)
+    m, ext = signals.with_signal(d, trig_t, trig_d, hold_ms=5)
+    real = m.type != 0
+    assert np.array_equal(m.ts[real], d.ts) and np.array_equal(m.ask_px[real], d.ask_px)
+    sig = np.flatnonzero(~real)
+    assert len(sig) == 6 and np.all(np.diff(m.ts) >= 0)
+    assert all(np.array_equal(m.bid_px[k], m.bid_px[k - 1]) for k in sig)
+    assert ext[sig[0]] == 1                                           # trigger row is active
+    # with no signal, inserting signal-only rows must not change the backtest
+    p = strategy.ASParams(gamma=0.02, k=2.5, sigma=1.0, tau=10)
+    r1 = bt.run(d, strategy.as_cst_quote, p.fp(), lut_f=np.full((2, 2), 0.5))
+    r2 = bt.run(m, strategy.as_cst_quote, p.fp(), lut_f=np.full((2, 2), 0.5), ext=np.zeros(len(m), np.int8))
+    assert len(r1.fills["t"]) == len(r2.fills["t"]) and np.isclose(r1.pnl_mtm, r2.pnl_mtm)
+
+
+def test_first_in_queue_mode_never_joins_a_queue(day):
+    p = strategy.ASParams(gamma=0.02, k=2.5, sigma=1.0, tau=10, max_pos=5)
+    cfg = bt.BacktestConfig(join_queue=False, feed_latency_ns=0, order_latency_ns=0)
+    r = bt.run(day, strategy.penny_quote, p.fp(), lut_f=np.full((2, 2), 0.5), cfg=cfg)
+    assert len(r.fills["t"]) > 20
+    assert np.all(r.fills["ahead0"] == 0)          # with zero latency we are always first in line
+    r2 = bt.run(day, strategy.penny_quote, p.fp(), lut_f=np.full((2, 2), 0.5),
+                cfg=bt.BacktestConfig(feed_latency_ns=0, order_latency_ns=0))
+    assert np.mean(r2.fills["ahead0"] == 0) < 0.9   # joining queues puts us behind others

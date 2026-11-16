@@ -103,8 +103,31 @@ def find_files(directory: str, ticker: str | None = None) -> list[tuple[str, str
 
 
 def load(message_file: str, orderbook_file: str | None = None, drop_halts: bool = True,
-         tick: int = 100) -> LobsterDay:
-    """Loads a LOBSTER message/orderbook pair into integer numpy arrays."""
+         tick: int = 100, max_levels: int | None = None, cache: bool = True) -> LobsterDay:
+    """Loads a LOBSTER message/orderbook pair into integer numpy arrays.
+
+    ``max_levels`` reads only the first levels of the book (the SPY sample has 30 levels and
+    an 852 MB orderbook file). With ``cache`` the parsed arrays are kept in a .npz next to the
+    message file, which makes later loads ~50x faster.
+    """
+    cache_path = message_file[:-4] + (f"_L{max_levels}" if max_levels else "") + ".npz"
+    if cache and os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(message_file):
+        z = np.load(cache_path)
+        return LobsterDay(str(z["ticker"]), str(z["date"]), int(z["levels"]), z["ts"], z["type"], z["order_id"],
+                          z["size"], z["price"], z["direction"], z["ask_px"], z["ask_sz"], z["bid_px"], z["bid_sz"],
+                          int(z["tick"]))
+    day = _load_csv(message_file, orderbook_file, drop_halts, tick, max_levels)
+    if cache:
+        try:
+            np.savez(cache_path, ticker=day.ticker, date=day.date, levels=day.levels, ts=day.ts, type=day.type,
+                     order_id=day.order_id, size=day.size, price=day.price, direction=day.direction,
+                     ask_px=day.ask_px, ask_sz=day.ask_sz, bid_px=day.bid_px, bid_sz=day.bid_sz, tick=day.tick)
+        except OSError:
+            pass
+    return day
+
+
+def _load_csv(message_file, orderbook_file, drop_halts, tick, max_levels) -> LobsterDay:
     if orderbook_file is None:
         orderbook_file = message_file.replace("_message_", "_orderbook_")
     m = _NAME_RE.search(os.path.basename(message_file))
@@ -114,7 +137,8 @@ def load(message_file: str, orderbook_file: str | None = None, drop_halts: bool 
                       names=["time", "type", "order_id", "size", "price", "direction"],
                       dtype={"time": np.float64, "type": np.int8, "order_id": np.int64,
                              "size": np.int64, "price": np.int64, "direction": np.int8})
-    ob = pd.read_csv(orderbook_file, header=None, dtype=np.int64).to_numpy()
+    usecols = list(range(4 * max_levels)) if max_levels else None
+    ob = pd.read_csv(orderbook_file, header=None, usecols=usecols, dtype=np.int64, engine="c").to_numpy()
     if len(ob) != len(msg):
         raise ValueError(f"message/orderbook length mismatch: {len(msg)} vs {len(ob)}")
     levels = ob.shape[1] // 4
