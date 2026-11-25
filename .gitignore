@@ -11,3 +11,4 @@ fpga/vivado/overlay/
 *.log
 .DS_Store
 .claude/
+exchange/build/
