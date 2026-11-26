@@ -7,5 +7,6 @@ make -s
 export MSG=${MSG:-../data/lobster/AAPL_2012-06-21_34200000_57600000_message_10.csv}
 export UI_PORT=${UI_PORT:-8080} DUR=${DUR:-1800} SPEED=${SPEED:-10} START=${START:-10:00:00}
 export A_NAME=${A_NAME:-cpu-a} B_NAME=${B_NAME:-cpu-b} A_DELAY_NS=${A_DELAY_NS:-0} B_DELAY_NS=${B_DELAY_NS:-0}
+export SNIPE_MS=${SNIPE_MS:-50}
 export OUT=${OUT:-../output/demo}
 exec ./scripts/race.sh

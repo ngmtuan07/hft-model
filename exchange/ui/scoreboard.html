@@ -129,7 +129,7 @@
 </header>
 
 <section class="panel hero">
-  <div class="label">Races won: who reacted first to the same market event</div>
+  <div class="label" id="hero-label">Races won: who reacted first to the same market event</div>
   <div id="hero"><div class="empty">Waiting for contestants…</div></div>
 </section>
 
@@ -138,15 +138,15 @@
 <section class="charts">
   <div class="panel">
     <div class="chart-head">
-      <div class="chart-title">Reaction latency distribution</div>
+      <div class="chart-title" id="hist-title">Reaction latency distribution</div>
       <div class="legend" id="hist-legend"></div>
     </div>
     <div class="chart-wrap" id="hist-wrap"><svg id="hist" viewBox="0 0 640 260" role="img" aria-label="Reaction latency histogram per contestant"></svg><div class="tip" id="hist-tip"></div></div>
-    <div class="note">Market data sent → order received, on the exchange clock. Solid line = median (p50), dashed = p99.</div>
+    <div class="note" id="hist-note">Market data sent → order received, on the exchange clock. Solid line = median (p50), dashed = p99.</div>
   </div>
   <div class="panel">
     <div class="chart-head">
-      <div class="chart-title">Reaction latency over time</div>
+      <div class="chart-title" id="time-title">Reaction latency over time</div>
       <div class="legend" id="time-legend"></div>
     </div>
     <div class="chart-wrap" id="time-wrap"><svg id="time" viewBox="0 0 640 260" role="img" aria-label="Median and p99 reaction latency over the last 90 seconds"></svg><div class="tip" id="time-tip"></div></div>
@@ -209,28 +209,41 @@ function renderHeader(s) {
 }
 
 // ---------- hero ----------
+const isSnipe = s => s.mode === "snipe";
 function renderHero(s) {
   const cs = s.contestants;
-  const totalWins = cs.reduce((a, c) => a + c.wins, 0);
-  const races = cs.length ? Math.max(...cs.map(c => c.races)) : 0;
-  if (cs.length < 2 || races === 0) {
-    $("hero").innerHTML = `<div class="empty">${cs.length < 2 ? "Waiting for contestants…" : "No contested races yet: waiting for both to react to the same event"}</div>`;
+  const snipe = isSnipe(s);
+  const W = snipe ? "snipe_wins" : "wins", R = snipe ? "snipe_recent_wins" : "recent_wins";
+  $("hero-label").textContent = snipe
+    ? "Stale quotes sniped: the exchange posts a mispriced order, the first to grab it wins it"
+    : "Races won: who reacted first to the same market event";
+  const totalWins = cs.reduce((a, c) => a + c[W], 0);
+  if (cs.length < 2 || totalWins === 0) {
+    $("hero").innerHTML = `<div class="empty">${cs.length < 2 ? "Waiting for contestants…" :
+      snipe ? "Waiting for the first stale quote…" : "No contested races yet: waiting for both to react to the same event"}</div>`;
     return;
   }
   // positions and colours follow the contestant, never the rank: the leader can change sides
   const ranked = cs.slice().sort((a, b) => a.id - b.id);
-  const side = (c, cls) => `<div class="hero-side ${cls}"><div class="hero-pct num">${pct(c.wins, totalWins).toFixed(0)}%</div>
+  const side = (c, cls) => `<div class="hero-side ${cls}"><div class="hero-pct num">${pct(c[W], totalWins).toFixed(0)}%</div>
       <div class="hero-name"><span class="swatch" style="background:${colorOf(c.id)}"></span>${esc(c.name)}</div></div>`;
   const segs = (key, total) => cs.map(c => `<div class="seg" style="flex-grow:${Math.max(c[key], 0)};background:${colorOf(c.id)}" title="${esc(c.name)}: ${c[key]}"></div>`).join("") ||
       `<div class="seg" style="flex-grow:1"></div>`;
-  const recentTotal = cs.reduce((a, c) => a + c.recent_wins, 0);
+  const recentTotal = cs.reduce((a, c) => a + c[R], 0);
+  const sub = snipe
+    ? `${fmtInt(s.snipes.taken)} stale quotes grabbed · ${fmtInt(s.snipes.expired)} missed by everyone`
+    : `${fmtInt(totalWins)} contested races`;
+  const quoteRaces = cs.reduce((a, c) => a + c.wins, 0);
+  const secondary = snipe && quoteRaces
+    ? `<div class="hero-sub num"><span>Quote races (both reacted to the same market update)</span><span>${cs.map(c => `${esc(c.name)} ${pct(c.wins, quoteRaces).toFixed(0)}%`).join(" · ")}</span></div>`
+    : "";
   $("hero").innerHTML = `
     <div class="hero-top">${side(ranked[0], "")}${cs.length === 2 ? side(ranked[1], "right") : ""}</div>
-    <div class="bar" aria-label="Share of races won">${segs("wins", totalWins)}</div>
-    <div class="hero-sub num"><span>${fmtInt(totalWins)} contested races</span>
-      <span>${cs.map(c => `${esc(c.name)} ${fmtInt(c.wins)}`).join(" · ")}</span></div>
-    <div class="recent num"><span>Last ${recentTotal} races</span>
-      <div class="bar small">${segs("recent_wins", recentTotal)}</div></div>`;
+    <div class="bar" aria-label="${snipe ? "Share of stale quotes sniped" : "Share of races won"}">${segs(W, totalWins)}</div>
+    <div class="hero-sub num"><span>${sub}</span>
+      <span>${cs.map(c => `${esc(c.name)} ${fmtInt(c[W])}`).join(" · ")}</span></div>
+    <div class="recent num"><span>Last ${recentTotal} ${snipe ? "stale quotes" : "races"}</span>
+      <div class="bar small">${segs(R, recentTotal)}</div></div>${secondary}`;
 }
 
 // ---------- cards ----------
@@ -245,9 +258,9 @@ function renderCards(s) {
       el.innerHTML = `
         <div class="card-head"><span class="swatch" style="background:${colorOf(c.id)}"></span><span class="nm"></span><span class="sub">contestant ${c.id}</span></div>
         <div class="stats">
-          <div class="stat"><div class="v num" data-k="wins"></div><div class="k">races won</div></div>
-          <div class="stat"><div class="v num" data-k="p50"></div><div class="k">median reaction</div></div>
-          <div class="stat"><div class="v num small" data-k="p99"></div><div class="k">p99 reaction</div></div>
+          <div class="stat"><div class="v num" data-k="wins"></div><div class="k" data-l="wins">races won</div></div>
+          <div class="stat"><div class="v num" data-k="p50"></div><div class="k" data-l="p50">median reaction</div></div>
+          <div class="stat"><div class="v num small" data-k="p99"></div><div class="k" data-l="p99">p99 reaction</div></div>
           <div class="stat"><div class="v num" data-k="fills"></div><div class="k">orders filled</div></div>
           <div class="stat"><div class="v num" data-k="rate"></div><div class="k">fills / second</div></div>
           <div class="stat"><div class="v num small" data-k="first"></div><div class="k">first-in-line fills</div></div>
@@ -269,7 +282,11 @@ function renderCards(s) {
     }
     el.querySelector(".nm").textContent = c.name;
     const set = (k, v) => { el.querySelector(`[data-k="${k}"]`).textContent = v; };
-    set("wins", fmtInt(c.wins));
+    const snipe = isSnipe(s);
+    set("wins", fmtInt(snipe ? c.snipe_wins : c.wins));
+    el.querySelector('[data-l="wins"]').textContent = snipe ? "stale quotes won" : "races won";
+    el.querySelector('[data-l="p50"]').textContent = snipe ? "median snipe reaction" : "median reaction";
+    el.querySelector('[data-l="p99"]').textContent = snipe ? "p99 snipe reaction" : "p99 reaction";
     set("p50", c.lat_n ? fmtNs(c.p50) : "–");
     set("p99", c.lat_n ? fmtNs(c.p99) : "–");
     set("fills", fmtInt(c.fills));
@@ -405,8 +422,8 @@ function hover(wrap, svg, tip, html, crosshair) {
 }
 
 function renderTable(s) {
-  const head = ["Contestant", "Races won", "Win %", "Fills", "First-in-line", "Fills/s", "Median", "p99", "p99.9", "Extra latency"];
-  const rows = s.contestants.map(c => [esc(c.name), fmtInt(c.wins), pct(c.wins, c.races).toFixed(1) + "%", fmtInt(c.fills),
+  const head = ["Contestant", "Stale quotes won", "Races won", "Win %", "Fills", "First-in-line", "Fills/s", "Median", "p99", "p99.9", "Extra latency"];
+  const rows = s.contestants.map(c => [esc(c.name), fmtInt(c.snipe_wins), fmtInt(c.wins), pct(c.wins, c.races).toFixed(1) + "%", fmtInt(c.fills),
     fmtInt(c.first_fills), fillRate(c.id).toFixed(1), fmtNs(c.p50), fmtNs(c.p99), fmtNs(c.p999), fmtUs(c.extra_ns / 1000)]);
   $("table").innerHTML = `<tr>${head.map(h => `<th>${h}</th>`).join("")}</tr>` +
     rows.map(r => `<tr>${r.map(v => `<td class="num">${v}</td>`).join("")}</tr>`).join("");
@@ -416,6 +433,11 @@ function esc(s) { return String(s).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<
 
 function update(s) {
   lastSnap = s;
+  const snipe = isSnipe(s);
+  $("hist-title").textContent = snipe ? "Stale-quote reaction latency" : "Reaction latency distribution";
+  $("time-title").textContent = snipe ? "Stale-quote reaction latency over time" : "Reaction latency over time";
+  $("hist-note").textContent = (snipe ? "Stale quote sent → order received" : "Market data sent → order received") +
+    ", on the exchange clock. Solid line = median (p50), dashed = p99.";
   remember(s);
   renderHeader(s);
   renderHero(s);

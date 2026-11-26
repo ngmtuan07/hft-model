@@ -3,6 +3,10 @@
 //   trader --name cpu --exchange 127.0.0.1:9000 [--delay-ns 0] [--qty 100] [--max-pos 500]
 //          [--duration 70] [--keep-ticks 1]
 //          [--core N] [--rt PRIO] [--mlock] [--busy-poll US] [--kernel-ts]     (latency tuning)
+//          [--no-mm]   only race for stale quotes, no market making
+//
+// Stale-quote race (Flash 0x12): the moment one arrives, an IOC on the opposite side at the stale
+// price is sent, before anything else in the same batch is processed.
 //
 // It decides only on market-flow updates (Tob type 0x10) and acts on the newest book it has;
 // updates caused by contestants (0x11) just refresh that book.
@@ -56,7 +60,7 @@ struct Config {
     int64_t max_pos = 500;
     double duration = 70;
     int core = -1, rt = 0, busy_poll = 0;
-    bool mlock = false, kernel_ts = false;
+    bool mlock = false, kernel_ts = false, no_mm = false;
 };
 
 class Trader {
@@ -111,6 +115,12 @@ public:
                     if (buf_[i].len != ssize_t(MSG_SIZE)) continue;
                     uint16_t type;
                     std::memcpy(&type, buf_[i].buf, sizeof(type));
+                    if (type == MSG_FLASH) {                // stale quote: fire first, think later
+                        Flash f;
+                        std::memcpy(&f, buf_[i].buf, sizeof(f));
+                        snipe(f, buf_[i].kernel_ts ? buf_[i].kernel_ts : t_user);
+                        continue;
+                    }
                     if (type >= MSG_ACK) {
                         ExecReport r;
                         std::memcpy(&r, buf_[i].buf, sizeof(r));
@@ -128,7 +138,7 @@ public:
                         if (ow > 0 && ow < 10000000000ll) md_oneway_.add(uint64_t(ow));   // only if clocks agree
                     }
                 }
-                if (act) {
+                if (act && !c_.no_mm) {
                     ++md_count_;
                     if (on_tob(latest)) {
                         // tick-to-trade inside this process: market data in -> orders handed to the kernel
@@ -154,9 +164,29 @@ private:
                     f(t2t_, 99.9).c_str(), util::fmt_ns(double(t2t_.max())).c_str(), (unsigned long long)t2t_.count());
         if (k2u_.count())
             std::printf("%s: kernel rx -> user p50 %s p99 %s\n", c_.name.c_str(), f(k2u_, 50).c_str(), f(k2u_, 99).c_str());
+        if (snipes_)
+            std::printf("%s: stale quotes answered %llu, tick-to-trade p50 %s p99 %s p99.9 %s\n", c_.name.c_str(),
+                        (unsigned long long)snipes_, f(snipe_t2t_, 50).c_str(), f(snipe_t2t_, 99).c_str(), f(snipe_t2t_, 99.9).c_str());
         std::printf("%s: send syscall p50 %s p99 %s; market data one-way p50 %s p99 %s (same host, same clock only)\n",
                     c_.name.c_str(), f(send_cost_, 50).c_str(), f(send_cost_, 99).c_str(), f(md_oneway_, 50).c_str(),
                     f(md_oneway_, 99).c_str());
+    }
+
+    // One IOC at the stale price, opposite side. Inventory limits deliberately do not apply: the race is
+    // the point, and a stale quote is worth taking from either side.
+    void snipe(const Flash& f, uint64_t t_in) {
+        const uint32_t coid = ++next_coid_;
+        const uint8_t side = f.side == SIDE_SELL ? SIDE_BUY : SIDE_SELL;
+        side_of_[coid & 4095] = side;
+        NewOrder o{};
+        o.type = MSG_NEW; o.len = MSG_SIZE; o.client_order_id = coid; o.trigger_seq = f.seq;
+        o.price = f.price; o.qty = f.qty; o.side = side; o.tif = TIF_IOC; o.post_only = 0;
+        util::spin_ns(c_.delay_ns);
+        o.client_ts = util::now_ns();
+        const void* p = &o;
+        net::send_batch(fd_, &p, MSG_SIZE, 1, connected_ ? nullptr : &ex_);
+        snipe_t2t_.add(o.client_ts - t_in);
+        ++snipes_;
     }
 
     // Returns true if orders were sent for this update.
@@ -245,8 +275,8 @@ private:
     SideState bid_, ask_;
     uint8_t side_of_[4096] = {};
     int64_t position_ = 0;
-    uint64_t md_count_ = 0, orders_ = 0, cancels_ = 0, fills_ = 0;
-    util::Histogram t2t_, k2u_, send_cost_, md_oneway_;
+    uint64_t md_count_ = 0, orders_ = 0, cancels_ = 0, fills_ = 0, snipes_ = 0;
+    util::Histogram t2t_, k2u_, send_cost_, md_oneway_, snipe_t2t_;
 };
 
 static_assert(offsetof(NewOrder, client_ts) == 24 && offsetof(Cancel, client_ts) == 24, "client_ts offset");
@@ -272,6 +302,7 @@ int main(int argc, char** argv) {
         else if (k == "--mlock") c.mlock = true;
         else if (k == "--busy-poll") c.busy_poll = std::atoi(v().c_str());
         else if (k == "--kernel-ts") c.kernel_ts = true;
+        else if (k == "--no-mm") c.no_mm = true;
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
     }
     try {

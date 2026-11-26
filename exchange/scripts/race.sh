@@ -7,6 +7,8 @@
 #   BIN     build directory (default build)
 #   EX_FLAGS / A_FLAGS / B_FLAGS  extra flags for the exchange / contestant A / contestant B,
 #           e.g. A_FLAGS="--core 2 --rt 50 --mlock --busy-poll 50 --kernel-ts" on Linux
+#   A_PREFIX / B_PREFIX  command prefix for a contestant, e.g. B_PREFIX="taskset -c 0,3-7"
+#   SNIPE_MS  stale-quote race: post a mispriced order every ~SNIPE_MS ms (off if unset)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MSG=${MSG:-../data/lobster/INTC_2012-06-21_34200000_57600000_message_10.csv}
@@ -17,13 +19,13 @@ OUT=${OUT:-../output/race}
 BIN=${BIN:-build}
 mkdir -p "$OUT"
 ./$BIN/exchange run ${EX_FLAGS:-} --messages "$MSG" --start "$START" --duration "$DUR" --speed "$SPEED" --wait 2 \
-    --stats "$OUT/stats.jsonl" --summary "$OUT/summary.json" ${ORDER_LOG:+--order-log "$OUT/orders.csv"} ${UI_PORT:+--http "$UI_PORT"} > "$OUT/exchange.log" 2>&1 &
+    --stats "$OUT/stats.jsonl" --summary "$OUT/summary.json" ${ORDER_LOG:+--order-log "$OUT/orders.csv"} ${UI_PORT:+--http "$UI_PORT"} ${SNIPE_MS:+--snipe-every-ms "$SNIPE_MS"} > "$OUT/exchange.log" 2>&1 &
 EX=$!
 [ -n "${UI_PORT:-}" ] && echo "scoreboard: http://localhost:$UI_PORT"
 trap 'kill $EX 2>/dev/null || true' EXIT
-./$BIN/trader ${A_FLAGS:-} --name "$A_NAME" --delay-ns "$A_DELAY_NS" --duration $((DUR + 90)) > "$OUT/$A_NAME.log" 2>&1 &
+${A_PREFIX:-} ./$BIN/trader ${A_FLAGS:-} --name "$A_NAME" --delay-ns "$A_DELAY_NS" --duration $((DUR + 90)) > "$OUT/$A_NAME.log" 2>&1 &
 TA=$!
-./$BIN/trader ${B_FLAGS:-} --name "$B_NAME" --delay-ns "$B_DELAY_NS" --duration $((DUR + 90)) > "$OUT/$B_NAME.log" 2>&1 &
+${B_PREFIX:-} ./$BIN/trader ${B_FLAGS:-} --name "$B_NAME" --delay-ns "$B_DELAY_NS" --duration $((DUR + 90)) > "$OUT/$B_NAME.log" 2>&1 &
 TB=$!
 wait $EX
 kill $TA $TB 2>/dev/null || true

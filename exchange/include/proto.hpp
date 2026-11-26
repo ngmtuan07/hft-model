@@ -14,6 +14,11 @@
 //                rule: contestants trade only on 0x10 events and just track the book on 0x11, so
 //                every race is a reaction to the same market event (no feedback loops between
 //                contestants). An FPGA checks one byte to apply it.
+//     Flash      stale-quote race (0x12): the exchange posts a mispriced order ("qty shares at price,
+//                on side") outside the replayed book. Every contestant wants it; the first
+//                NewOrder IOC on the opposite side, at that price or better, with trigger_seq =
+//                Flash.seq gets it. Later arrivals are cancelled. Tells speed apart cleanly
+//                because the opportunity does not depend on a contestant's own position/orders.
 //     ExecReport ack / reject / fill / cancelled, for that contestant's orders only
 //
 // trigger_seq on NewOrder/Cancel is the Tob sequence number the contestant reacted to.
@@ -32,6 +37,7 @@ constexpr uint16_t MSG_NEW = 0x02;
 constexpr uint16_t MSG_CANCEL = 0x03;
 constexpr uint16_t MSG_TOB = 0x10;             // top of book changed by market (historical) flow
 constexpr uint16_t MSG_TOB_CONTESTANT = 0x11;  // same layout; changed by a contestant's order or cancel
+constexpr uint16_t MSG_FLASH = 0x12;           // stale-quote race: a mispriced order, first IOC to hit it wins
 constexpr uint16_t MSG_ACK = 0x81;
 constexpr uint16_t MSG_REJECT = 0x82;
 constexpr uint16_t MSG_FILL = 0x83;
@@ -93,6 +99,18 @@ struct Tob {              // 32 bytes
     uint32_t ask_qty;
 };
 
+struct Flash {            // 32 bytes
+    uint16_t type;        // MSG_FLASH
+    uint16_t len;
+    uint32_t seq;         // shares the Tob sequence space; use it as trigger_seq
+    uint64_t exch_ts;
+    uint32_t price;       // ticks
+    uint32_t qty;
+    uint32_t flash_id;
+    uint8_t side;         // side of the STALE order: SIDE_SELL = you can buy, SIDE_BUY = you can sell
+    uint8_t pad[3];
+};
+
 struct ExecReport {       // 32 bytes
     uint16_t type;        // MSG_ACK / REJECT / FILL / CANCELLED / HELLO_ACK
     uint16_t len;
@@ -110,6 +128,7 @@ static_assert(sizeof(NewOrder) == 32, "NewOrder must be 32 bytes");
 static_assert(sizeof(Cancel) == 32, "Cancel must be 32 bytes");
 static_assert(sizeof(Tob) == 32, "Tob must be 32 bytes");
 static_assert(sizeof(ExecReport) == 32, "ExecReport must be 32 bytes");
+static_assert(sizeof(Flash) == 32, "Flash must be 32 bytes");
 constexpr size_t MSG_SIZE = 32;
 
 }  // namespace proto

@@ -4,6 +4,7 @@
 //                   [--port 9000] [--wait 2] [--stats out.jsonl] [--summary out.json] [--core N]
 //                   [--http 8080 [--ui ui/scoreboard.html]]     live scoreboard at http://localhost:8080
 //                   [--kernel-ts] [--busy-poll US] [--rt PRIO] [--mlock]   Linux latency tuning
+//                   [--snipe-every-ms 50 [--snipe-ttl-ms 20] [--snipe-qty 100]]  stale-quote race
 //   exchange verify --messages <file>          replay with no contestants; compare our top of book
 //                                              with LOBSTER's after every message
 //   exchange bench  --messages <file> [--reps 5]  matching-engine throughput and per-message latency
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <random>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,6 +46,8 @@ struct Args {
     bool no_reconcile = false;      // replay messages only, without snapping to LOBSTER snapshots
     bool kernel_ts = false, mlock = false;   // kernel receive timestamps = order arrival time
     int busy_poll = 50, rt = 0;
+    double snipe_ms = 0, snipe_ttl_ms = 20;  // stale-quote race: mean interval (0 = off) and lifetime
+    int snipe_qty = 100;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -71,6 +75,9 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--busy-poll") a.busy_poll = std::atoi(v().c_str());
         else if (k == "--rt") a.rt = std::atoi(v().c_str());
         else if (k == "--mlock") a.mlock = true;
+        else if (k == "--snipe-every-ms") a.snipe_ms = std::atof(v().c_str());
+        else if (k == "--snipe-ttl-ms") a.snipe_ttl_ms = std::atof(v().c_str());
+        else if (k == "--snipe-qty") a.snipe_qty = std::atoi(v().c_str());
         else if (k == "--ui") a.ui = v();
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
     }
@@ -266,14 +273,26 @@ struct Contestant {
     static constexpr int DISP_BINS = 50;          // display histogram: 10 bins/decade, 100 ns .. 10 ms
     uint32_t disp[DISP_BINS] = {};
     uint64_t recent_wins = 0;                     // wins among the last RECENT races (any contestant)
+    // stale-quote race: reaction latency to Flash messages only, kept apart from quote reactions
+    uint64_t snipe_tries = 0, snipe_wins = 0, snipe_recent_wins = 0;
+    util::Histogram snipe_lat, snipe_slot[SLOTS];
+    uint32_t snipe_disp[DISP_BINS] = {};
 };
+
+inline int disp_bin(uint64_t d) {
+    int b = int(std::floor(10.0 * std::log10(double(d)) - 20.0));   // 100 ns = bin 0, 10 bins per decade
+    return b < 0 ? 0 : (b >= Contestant::DISP_BINS ? Contestant::DISP_BINS - 1 : b);
+}
+
+// The live stale quote (at most one at a time).
+struct FlashState { bool active = false; uint32_t seq = 0, id = 0, px = 0, qty = 0; uint8_t side = 0; uint64_t expire = 0; };
 
 // An order held back by the latency slider (as if its cable were longer).
 struct Held { uint64_t release; sockaddr_in from; unsigned char buf[MSG_SIZE]; };
 
 struct PendingMarkout { uint64_t due_hist_ns; uint32_t owner; int8_t sgn; me::Px px; me::Qty qty; };
 
-struct SeqInfo { uint32_t seq = 0; uint32_t mask = 0; uint32_t first = 0; bool raced = false; };
+struct SeqInfo { uint32_t seq = 0; uint32_t mask = 0; uint32_t first = 0; bool raced = false; bool flash = false; };
 
 class Exchange {
 public:
@@ -360,6 +379,7 @@ public:
                     settle_markouts();
                 }
             }
+            if (args_.snipe_ms > 0) flash_tick(now);
             // 3. scoreboard
             const double el = double(now - wall0) / 1e9;
             if (now >= next_print) {
@@ -423,6 +443,7 @@ private:
             judge(*c, o.trigger_seq, t_rx);
             if (o.client_ts && t_rx > o.client_ts) c->oe_oneway.add(t_rx - o.client_ts);
             ++c->orders;
+            if (is_flash_seq(o.trigger_seq)) { snipe(*c, o, t_rx); return; }   // stale-quote race
             me::Qty rem = 0;
             const auto r = book_.submit(me::client_key(c->id, o.client_order_id), c->id, o.client_order_id, o.side,
                                         o.price, o.qty, o.tif == TIF_IOC, o.post_only != 0, &rem);
@@ -459,15 +480,25 @@ private:
         if (si.seq != s) return;
         const uint32_t bit = 1u << c.id;
         if (si.mask & bit) return;                 // only the first reaction counts
+        if (si.flash) {                            // stale-quote race: winner is decided by the fill
+            const uint64_t sent = c.md_sent_ts[s % RING];
+            if (sent && t_rx > sent) {
+                const uint64_t d = t_rx - sent;
+                c.snipe_lat.add(d);
+                c.snipe_slot[c.slot].add(d);
+                ++c.snipe_disp[disp_bin(d)];
+            }
+            ++c.snipe_tries;
+            si.mask |= bit;
+            return;
+        }
         const uint64_t sent = c.md_sent_ts[s % RING];
         if (sent && t_rx > sent) {
             const uint64_t d = t_rx - sent;
             c.lat.add(d);
             c.lat_window.add(d);
             c.lat_slot[c.slot].add(d);
-            int b = int(std::floor(10.0 * std::log10(double(d)) - 20.0));   // 100 ns = bin 0
-            b = b < 0 ? 0 : (b >= Contestant::DISP_BINS ? Contestant::DISP_BINS - 1 : b);
-            ++c.disp[b];
+            ++c.disp[disp_bin(d)];
         }
         if (si.mask == 0) { si.first = c.id; }
         else {
@@ -485,6 +516,67 @@ private:
             ++c.races;
         }
         si.mask |= bit;
+    }
+
+    // ---- stale-quote race ------------------------------------------------------------------
+    bool is_flash_seq(uint32_t s) const {
+        if (s == 0 || s > seq_ || seq_ - s >= RING) return false;
+        const SeqInfo& si = seqs_[s % RING];
+        return si.seq == s && si.flash;
+    }
+
+    // Expire the live stale quote, and post a new one at random intervals (0.5x..1.5x the mean,
+    // so nobody can anticipate it). A stale SELL sits at today's best bid (you can buy a full spread
+    // below the ask); a stale BUY at the best ask. It is not in the replayed book.
+    void flash_tick(uint64_t now) {
+        if (flash_.active && now >= flash_.expire) { flash_.active = false; ++flash_expired_; }
+        if (flash_.active || now < next_flash_) return;
+        std::uniform_real_distribution<double> u(0.5, 1.5);
+        next_flash_ = now + uint64_t(args_.snipe_ms * 1e6 * u(rng_));
+        if (!last_.bid || !last_.ask || contestants_.empty()) return;
+        flash_.side = (rng_() & 1) ? SIDE_SELL : SIDE_BUY;
+        flash_.px = flash_.side == SIDE_SELL ? last_.bid : last_.ask;
+        flash_.qty = uint32_t(args_.snipe_qty);
+        flash_.id += 1;
+        flash_.seq = ++seq_;
+        flash_.expire = now + uint64_t(args_.snipe_ttl_ms * 1e6);
+        flash_.active = true;
+        ++flash_sent_;
+        SeqInfo& si = seqs_[flash_.seq % RING];
+        si = SeqInfo{flash_.seq, 0, 0, false, true};
+        Flash f{MSG_FLASH, uint16_t(MSG_SIZE), flash_.seq, util::now_ns(), flash_.px, flash_.qty, flash_.id, flash_.side, {}};
+        const size_t n = contestants_.size();
+        const uint64_t r = rot_++;                 // same fair rotation as market updates
+        for (size_t k = 0; k < n; ++k) {
+            Contestant& c = contestants_[(r + k) % n];
+            ::sendto(fd_, &f, sizeof(f), 0, reinterpret_cast<const sockaddr*>(&c.md), sizeof(c.md));
+            c.md_sent_ts[flash_.seq % RING] = util::now_ns();
+        }
+    }
+
+    // An IOC aimed at a stale quote: the first valid one takes it, everyone later is cancelled.
+    void snipe(Contestant& c, const NewOrder& o, uint64_t t_rx) {
+        const bool ok = flash_.active && o.trigger_seq == flash_.seq && o.tif == TIF_IOC && o.side != flash_.side &&
+                        (o.side == SIDE_BUY ? o.price >= flash_.px : o.price <= flash_.px) && o.qty > 0;
+        uint32_t q = 0;
+        if (ok) {
+            q = o.qty < flash_.qty ? o.qty : flash_.qty;
+            flash_.qty -= q;
+            fill(c.id, o.client_order_id, o.side, flash_.px, q, o.qty - q, false);
+            if (flash_.qty == 0) {
+                flash_.active = false;
+                ++flash_taken_;
+                ++c.snipe_wins;
+                if (snipe_n_ == RECENT) { --contestants_[snipe_recent_[snipe_i_] - 1].snipe_recent_wins; } else ++snipe_n_;
+                snipe_recent_[snipe_i_] = uint8_t(c.id);
+                snipe_i_ = (snipe_i_ + 1) % RECENT;
+                ++c.snipe_recent_wins;
+            }
+        }
+        if (q < o.qty) reply(c.oe, MSG_CANCELLED, o.client_order_id, o.price, 0, 0, 0);
+        if (olog_) std::fprintf(olog_, "%llu,%u,snipe,%u,%u,%u,%u,%u,%d,%u,%u,%u,%u\n", (unsigned long long)t_rx, c.id,
+                                o.client_order_id, o.side, o.price, o.qty, o.trigger_seq, q ? 1 : 0, last_.bid, last_.bid_qty,
+                                last_.ask, last_.ask_qty);
     }
 
     void hello(const Hello* h, const sockaddr_in& from) {
@@ -569,6 +661,9 @@ private:
         std::printf("[%6.1fs] replay %s  seq %u  open %zu", el, hms(lob_ts).c_str(), seq_, book_.open_orders());
         for (auto& c : contestants_) {
             const uint64_t fps = c.fills - c.fills_last;
+            if (args_.snipe_ms > 0)
+                std::printf(" | %s: snipes %llu/%llu p50 %s", c.name.c_str(), (unsigned long long)c.snipe_wins,
+                            (unsigned long long)flash_taken_, util::fmt_ns(double(c.snipe_lat.percentile(50))).c_str());
             std::printf(" | %s: won %llu/%llu fills %llu (+%llu/s, first %llu) pos %+lld p50 %s p99 %s", c.name.c_str(),
                         (unsigned long long)c.wins, (unsigned long long)c.races, (unsigned long long)c.fills,
                         (unsigned long long)fps, (unsigned long long)c.first_fills, (long long)c.position, util::fmt_ns(double(c.lat.percentile(50))).c_str(),
@@ -604,52 +699,69 @@ private:
             c.lat.reset(); c.lat_window.reset(); c.oe_oneway.reset();
             for (auto& h : c.lat_slot) h.reset();
             std::memset(c.disp, 0, sizeof(c.disp));
+            c.snipe_tries = c.snipe_wins = c.snipe_recent_wins = 0;
+            c.snipe_lat.reset();
+            for (auto& h : c.snipe_slot) h.reset();
+            std::memset(c.snipe_disp, 0, sizeof(c.snipe_disp));
         }
         recent_n_ = recent_i_ = 0;
+        snipe_n_ = snipe_i_ = 0;
+        flash_sent_ = flash_taken_ = flash_expired_ = 0;
         std::printf("exchange: statistics reset from the scoreboard\n");
         std::fflush(stdout);
     }
 
     // JSON for the live scoreboard (published ~5x per second; see include/http.hpp).
     void snapshot(double el, uint64_t lob_ts, bool started) {
+        // with the stale-quote race on, the latency figures are snipe reactions only: every
+        // contestant answers every stale quote, so the distributions compare like with like
+        const bool snipe_mode = args_.snipe_ms > 0;
         std::string s;
         s.reserve(4096);
         char b[1024];
         std::snprintf(b, sizeof(b),
                       "{\"t\": %.3f, \"started\": %s, \"finished\": %s, \"waiting_for\": %d, \"symbol\": \"%s\", \"speed\": %.2f, "
                       "\"replay\": \"%s\", \"seq\": %u, \"bid\": %u, \"bid_qty\": %u, \"ask\": %u, \"ask_qty\": %u, "
-                      "\"recent_races\": %d, \"hist_lo_ns\": 100, \"bins_per_decade\": 10, \"contestants\": [",
+                      "\"recent_races\": %d, \"hist_lo_ns\": 100, \"bins_per_decade\": 10, \"mode\": \"%s\", "
+                      "\"snipes\": {\"posted\": %llu, \"taken\": %llu, \"expired\": %llu, \"recent\": %d}, \"contestants\": [",
                       el, started ? "true" : "false", finished_ ? "true" : "false",
                       started ? 0 : args_.wait - int(contestants_.size()), symbol_.c_str(), args_.speed,
-                      hms(lob_ts).c_str(), seq_, last_.bid, last_.bid_qty, last_.ask, last_.ask_qty, recent_n_);
+                      hms(lob_ts).c_str(), seq_, last_.bid, last_.bid_qty, last_.ask, last_.ask_qty, recent_n_,
+                      snipe_mode ? "snipe" : "quote", (unsigned long long)flash_sent_, (unsigned long long)flash_taken_,
+                      (unsigned long long)flash_expired_, snipe_n_);
         s += b;
         const double mid = (double(last_.bid) + double(last_.ask)) / 2.0;
         for (size_t i = 0; i < contestants_.size(); ++i) {
             auto& c = contestants_[i];
+            const util::Histogram& L = snipe_mode ? c.snipe_lat : c.lat;
+            const uint32_t* disp = snipe_mode ? c.snipe_disp : c.disp;
             util::Histogram win;                      // last ~1 s of reactions
-            for (const auto& h : c.lat_slot) win.merge(h);
+            for (const auto& h : (snipe_mode ? c.snipe_slot : c.lat_slot)) win.merge(h);
             std::snprintf(b, sizeof(b),
                           "%s{\"id\": %u, \"name\": \"%s\", \"races\": %llu, \"wins\": %llu, \"recent_wins\": %llu, "
                           "\"fills\": %llu, \"first_fills\": %llu, \"fill_qty\": %llu, \"orders\": %llu, \"cancels\": %llu, "
                           "\"rejects\": %llu, \"position\": %lld, \"pnl_usd\": %.2f, \"markout_ticks\": %.3f, "
                           "\"lat_n\": %llu, \"p50\": %llu, \"p99\": %llu, \"p999\": %llu, \"max\": %llu, "
-                          "\"win_n\": %llu, \"win_p50\": %llu, \"win_p99\": %llu, \"extra_ns\": %lld, \"hist\": [",
+                          "\"win_n\": %llu, \"win_p50\": %llu, \"win_p99\": %llu, \"extra_ns\": %lld, "
+                          "\"snipe_tries\": %llu, \"snipe_wins\": %llu, \"snipe_recent_wins\": %llu, \"hist\": [",
                           i ? ", " : "", c.id, c.name.c_str(), (unsigned long long)c.races, (unsigned long long)c.wins,
                           (unsigned long long)c.recent_wins, (unsigned long long)c.fills, (unsigned long long)c.first_fills,
                           (unsigned long long)c.fill_qty, (unsigned long long)c.orders, (unsigned long long)c.cancels,
                           (unsigned long long)c.rejects, (long long)c.position,
                           last_.bid && last_.ask ? (double(c.cash) + double(c.position) * mid) / 100.0 : 0.0,
                           c.markout_qty ? double(c.markout_x2) / 2.0 / double(c.markout_qty) : 0.0,
-                          (unsigned long long)c.lat.count(), (unsigned long long)c.lat.percentile(50),
-                          (unsigned long long)c.lat.percentile(99), (unsigned long long)c.lat.percentile(99.9),
-                          (unsigned long long)c.lat.max(), (unsigned long long)win.count(),
+                          (unsigned long long)L.count(), (unsigned long long)L.percentile(50),
+                          (unsigned long long)L.percentile(99), (unsigned long long)L.percentile(99.9),
+                          (unsigned long long)L.max(), (unsigned long long)win.count(),
                           (unsigned long long)win.percentile(50), (unsigned long long)win.percentile(99),
-                          (long long)shared_.extra_ns[c.id - 1].load());
+                          (long long)shared_.extra_ns[c.id - 1].load(), (unsigned long long)c.snipe_tries,
+                          (unsigned long long)c.snipe_wins, (unsigned long long)c.snipe_recent_wins);
             s += b;
-            for (int k = 0; k < Contestant::DISP_BINS; ++k) { s += k ? "," : ""; s += std::to_string(c.disp[k]); }
+            for (int k = 0; k < Contestant::DISP_BINS; ++k) { s += k ? "," : ""; s += std::to_string(disp[k]); }
             s += "]}";
             c.slot = (c.slot + 1) % Contestant::SLOTS;
             c.lat_slot[c.slot].reset();
+            c.snipe_slot[c.slot].reset();
         }
         s += "]}";
         shared_.publish(std::move(s));
@@ -657,7 +769,9 @@ private:
 
     void summary(double el, size_t replayed) {
         std::string s = "{\"wall_s\": " + std::to_string(el) + ", \"history_messages\": " + std::to_string(replayed) +
-                        ", \"tob_updates\": " + std::to_string(seq_) + ", \"contestants\": [";
+                        ", \"tob_updates\": " + std::to_string(seq_) + ", \"stale_quotes_posted\": " + std::to_string(flash_sent_) +
+                        ", \"stale_quotes_taken\": " + std::to_string(flash_taken_) +
+                        ", \"stale_quotes_expired\": " + std::to_string(flash_expired_) + ", \"contestants\": [";
         const double mid = (double(last_.bid) + double(last_.ask)) / 2.0;
         for (size_t i = 0; i < contestants_.size(); ++i) {
             auto& c = contestants_[i];
@@ -667,7 +781,9 @@ private:
                           "\"fills_per_s\": %.2f, \"fill_qty\": %llu, \"orders\": %llu, \"cancels\": %llu, \"rejects\": %llu, "
                           "\"position\": %lld, \"pnl_mark_to_mid_usd\": %.2f, \"reactions\": %llu, \"lat_p50_ns\": %llu, "
                           "\"lat_p99_ns\": %llu, \"lat_p999_ns\": %llu, \"lat_max_ns\": %llu, \"order_oneway_p50_ns\": %llu, "
-                          "\"first_in_line_fills\": %llu, \"markout_1s_ticks_per_share\": %.3f, \"markout_1s_usd\": %.2f}",
+                          "\"first_in_line_fills\": %llu, \"markout_1s_ticks_per_share\": %.3f, \"markout_1s_usd\": %.2f, "
+                          "\"snipe_wins\": %llu, \"snipe_tries\": %llu, \"snipe_p50_ns\": %llu, \"snipe_p99_ns\": %llu, "
+                          "\"snipe_p999_ns\": %llu}",
                           i ? ", " : "", c.name.c_str(), (unsigned long long)c.races, (unsigned long long)c.wins,
                           c.races ? 100.0 * double(c.wins) / double(c.races) : 0.0, (unsigned long long)c.fills,
                           el > 0 ? double(c.fills) / el : 0.0, (unsigned long long)c.fill_qty, (unsigned long long)c.orders,
@@ -677,7 +793,9 @@ private:
                           (unsigned long long)c.lat.percentile(99.9), (unsigned long long)c.lat.max(),
                           (unsigned long long)c.oe_oneway.percentile(50), (unsigned long long)c.first_fills,
                           c.markout_qty ? double(c.markout_x2) / 2.0 / double(c.markout_qty) : 0.0,
-                          double(c.markout_x2) / 2.0 / 100.0);
+                          double(c.markout_x2) / 2.0 / 100.0, (unsigned long long)c.snipe_wins,
+                          (unsigned long long)c.snipe_tries, (unsigned long long)c.snipe_lat.percentile(50),
+                          (unsigned long long)c.snipe_lat.percentile(99), (unsigned long long)c.snipe_lat.percentile(99.9));
             s += b;
         }
         s += "]}";
@@ -716,6 +834,12 @@ private:
     static constexpr int RECENT = 100;
     uint8_t recent_[RECENT] = {};
     int recent_n_ = 0, recent_i_ = 0;
+    // stale-quote race
+    FlashState flash_;
+    uint64_t next_flash_ = 0, flash_sent_ = 0, flash_taken_ = 0, flash_expired_ = 0;
+    std::mt19937_64 rng_{20120621};
+    uint8_t snipe_recent_[RECENT] = {};
+    int snipe_n_ = 0, snipe_i_ = 0;
 };
 
 }  // namespace

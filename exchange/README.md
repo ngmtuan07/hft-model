@@ -66,6 +66,7 @@ keeps the FPGA parser to a few registers and comparators. Prices are ticks ($0.0
 | `0x03` | → exchange | Cancel | `coid:u32, trigger_seq:u32, pad[12], client_ts:u64` |
 | `0x10` | → contestant | Tob, caused by market flow | `seq:u32, exch_ts:u64, bid:u32, bid_qty:u32, ask:u32, ask_qty:u32` |
 | `0x11` | → contestant | Tob, caused by a contestant | same layout |
+| `0x12` | → contestant | Flash: a stale quote is up for grabs | `seq:u32, exch_ts:u64, price:u32, qty:u32, flash_id:u32, side:u8 (of the stale order), pad[3]` |
 | `0x81`..`0x85` | → contestant | Ack / Reject / Fill / Cancelled / HelloAck | `coid:u32, price:u32, qty:u32, leaves:u32, reason:u32, exch_ts:u64` |
 
 A contestant sends `Hello` with the UDP port it wants market data on. The exchange registers it by
@@ -88,6 +89,24 @@ historical messages into 340,000 book updates.
   This is needed on 0.2% of messages for INTC/MSFT and 3% for AAPL (icebergs).
 * History is replayed in batches: messages that share a timestamp form one exchange event and produce at most one
   `Tob`. Order entry is polled between every batch.
+
+## Stale-quote race (`--snipe-every-ms`, on in the demos)
+
+At random intervals (0.5–1.5× the mean, so nobody can anticipate it) the exchange posts a mispriced order: a stale
+**sell at the current best bid** (buy it a full spread below the ask) or a stale **buy at the best ask**. It's announced
+to every contestant with a `0x12 Flash` message, in the same fair send rotation as market data. The first `NewOrder` IOC
+on the opposite side, at that price or better, with `trigger_seq` = the flash's `seq`, gets the fill. Everyone later is
+cancelled. A flash nobody takes within `--snipe-ttl-ms` (default 20) expires. The stale order sits outside the replayed
+book, so the historical market is undisturbed.
+
+Why it exists: in the quote race, a race only counts when both engines react to the same market update. Their positions
+and resting orders drift apart, so only ~17% of updates are contested, and a stalled engine *skips* updates instead
+of losing races, which leaves the contested ones mostly coin flips. Every stale quote is wanted by every contestant
+whatever its state, so a stalled engine simply loses. With the race on, the scoreboard headlines "stale quotes sniped",
+and its latency charts show snipe reactions only (like for like). The quote race stays as a secondary line.
+
+The contestant's side is one rule: on a `0x12`, immediately send an IOC on the other side at `price` for `qty`. That's
+easy for an FPGA.
 
 ## Judging and metrics
 
@@ -182,6 +201,38 @@ What this shows:
   gets the same median, because nothing competes for its core. On a loaded host, pinning and isolation keep the median too.
 * **This is a VM.** The remaining p99/p99.9 is mostly hypervisor scheduling noise. Bare metal with `isolcpus` and
   the tuning script applied is the real test.
+
+### Tuned vs untuned demo (`scripts/demo_tuning.sh`)
+
+```bash
+./scripts/demo_tuning_docker.sh      # on a Mac (Docker Desktop); on Linux: ./scripts/demo_tuning.sh
+```
+
+Open http://localhost:8080. Both engines run the identical strategy, and only the environment differs. Busy-loop processes
+load the shared cores to simulate a busy server (`NOISE`, `SHARED`):
+
+* **tuned:** a core of its own that the load never touches (what `isolcpus` gives you on real hardware), plus `--busy-poll 50 --kernel-ts --mlock`
+* **untuned:** an ordinary process on the shared cores, competing with the load
+
+Quote race only (before the stale-quote race existed), measured in the Docker VM on the M1 (AAPL, 10× speed, about 3 minutes):
+
+| load | races won (tuned / untuned) | median reaction | p99 reaction |
+|---|---|---|---|
+| 6 busy loops on 3 shared cores (default) | 53% / 47% | 4.6–5.0 µs vs 11.5–14 µs | 0.54 ms vs 5.4–6.0 ms |
+| 12 busy loops on 6 shared cores | 64% / 36% | 7.2 µs vs 54 µs | 3.3 ms vs 11.8 ms |
+
+With the stale-quote race on (the default, `SNIPE_MS=50`), about 5 minutes into the demo:
+
+| | stale quotes won | answered | median snipe reaction | p99 | orders filled |
+|---|---|---|---|---|---|
+| tuned | **833 of 1,075 (77%)** | 1,077 / 1,077 | **5.1 µs** | 3.8 ms | 1,218 |
+| untuned | 242 (23%) | 1,077 / 1,077 | 573 µs | 15 ms | 646 |
+
+In the same run, the old quote race was 44% / 56%. A race there counts only when both engines react to the same market event.
+A stalled engine skips the events it fell behind on and acts on the newest book, so its worst moments show up as missed events,
+not lost races. That's why the stale-quote race is now the headline. On a Mac (no load, `scripts/race.sh`) identical
+engines split stale quotes 200 / 204, and a 20 µs handicap loses 361 / 404. On a laptop VM the "reserved" core isn't fully reserved either: under heavy load the hypervisor also pauses
+it (hence the tuned engine's millisecond p99). On a real server with `isolcpus` the tuned engine's tail should stay in the tens of µs.
 
 ### Next steps (need Linux hardware)
 
