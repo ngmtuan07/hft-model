@@ -12,19 +12,28 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #endif
 
 namespace util {
 
+// Clock for all latency bookkeeping. Default: monotonic. With kernel receive timestamps enabled
+// (which the kernel stamps in CLOCK_REALTIME) every timestamp must come from the same clock, so
+// use_realtime_clock() switches the whole process over.
+inline bool& realtime_flag() { static bool f = false; return f; }
+inline void use_realtime_clock(bool on) { realtime_flag() = on; }
+
 inline uint64_t now_ns() {
-    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count());
+    timespec ts;
+    clock_gettime(realtime_flag() ? CLOCK_REALTIME : CLOCK_MONOTONIC, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
 
 inline void spin_ns(uint64_t ns) {
@@ -45,6 +54,25 @@ inline bool pin_to_core(int core) {
     (void)core;
     return false;
 #endif
+}
+
+// Linux: SCHED_FIFO at `prio` (needs CAP_SYS_NICE) and lock all memory (needs memlock limit).
+inline std::string realtime_setup(int prio, bool lock_memory) {
+    std::string out;
+#ifdef __linux__
+    if (prio > 0) {
+        sched_param sp{};
+        sp.sched_priority = prio;
+        out += sched_setscheduler(0, SCHED_FIFO, &sp) == 0 ? "SCHED_FIFO " + std::to_string(prio) : std::string("SCHED_FIFO failed (") + std::strerror(errno) + ")";
+    }
+    if (lock_memory) {
+        if (!out.empty()) out += ", ";
+        out += mlockall(MCL_CURRENT | MCL_FUTURE) == 0 ? "memory locked" : std::string("mlockall failed (") + std::strerror(errno) + ")";
+    }
+#else
+    if (prio > 0 || lock_memory) out = "real-time scheduling / memory locking: Linux only, skipped";
+#endif
+    return out;
 }
 
 // Log-linear histogram (HDR-style): 2^5 sub-buckets per power of two, 1 ns .. ~68 s.
@@ -114,7 +142,7 @@ inline sockaddr_in make_addr(const std::string& host, uint16_t port) {
 }
 
 // Non-blocking UDP socket bound to host:port (port 0 = any).
-inline int udp_socket(const std::string& host, uint16_t port, int rcvbuf = 4 << 20) {
+inline int udp_socket(const std::string& host, uint16_t port, int rcvbuf = 4 << 20, int busy_poll_us = 50) {
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) throw std::runtime_error("socket()");
     const int one = 1;
@@ -122,8 +150,11 @@ inline int udp_socket(const std::string& host, uint16_t port, int rcvbuf = 4 << 
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
 #ifdef SO_BUSY_POLL
-    const int busy = 50;  // Linux: let the kernel spin on the NIC queue (us)
-    setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy, sizeof(busy));
+    // Linux: the kernel spins on the NIC queue for up to this many us on each receive. Values above
+    // net.core.busy_read need CAP_NET_ADMIN; failure is harmless (falls back to interrupts).
+    if (busy_poll_us > 0) setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
+#else
+    (void)busy_poll_us;
 #endif
     sockaddr_in a = make_addr(host, port);
     if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)

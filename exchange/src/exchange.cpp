@@ -3,6 +3,7 @@
 //   exchange run    --messages <LOBSTER message file> [--start 10:00:00] [--duration 60] [--speed 1]
 //                   [--port 9000] [--wait 2] [--stats out.jsonl] [--summary out.json] [--core N]
 //                   [--http 8080 [--ui ui/scoreboard.html]]     live scoreboard at http://localhost:8080
+//                   [--kernel-ts] [--busy-poll US] [--rt PRIO] [--mlock]   Linux latency tuning
 //   exchange verify --messages <file>          replay with no contestants; compare our top of book
 //                                              with LOBSTER's after every message
 //   exchange bench  --messages <file> [--reps 5]  matching-engine throughput and per-message latency
@@ -22,6 +23,7 @@
 
 #include "book.hpp"
 #include "http.hpp"
+#include "net.hpp"
 #include "lobster.hpp"
 #include "proto.hpp"
 #include "util.hpp"
@@ -40,6 +42,8 @@ struct Args {
     double speed = 1.0;             // 1 = real time, 0 = as fast as possible
     int port = 9000, wait = 0, reps = 5, core = -1, max_contestants = web::MAX_CONTESTANTS, http = 0;
     bool no_reconcile = false;      // replay messages only, without snapping to LOBSTER snapshots
+    bool kernel_ts = false, mlock = false;   // kernel receive timestamps = order arrival time
+    int busy_poll = 50, rt = 0;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -63,6 +67,10 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--core") a.core = std::atoi(v().c_str());
         else if (k == "--no-reconcile") a.no_reconcile = true;
         else if (k == "--http") a.http = std::atoi(v().c_str());
+        else if (k == "--kernel-ts") a.kernel_ts = true;
+        else if (k == "--busy-poll") a.busy_poll = std::atoi(v().c_str());
+        else if (k == "--rt") a.rt = std::atoi(v().c_str());
+        else if (k == "--mlock") a.mlock = true;
         else if (k == "--ui") a.ui = v();
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
     }
@@ -273,7 +281,8 @@ public:
         : args_(a), msgs_(lob::load_messages(a.messages)), book_(max_price(msgs_), *this), rp_{book_} {
         if (!a.no_reconcile) targets_ = lob::load_targets(lob::orderbook_path(a.messages), msgs_);
         contestants_.reserve(size_t(a.max_contestants));
-        fd_ = util::udp_socket(a.host, uint16_t(a.port));
+        fd_ = util::udp_socket(a.host, uint16_t(a.port), 8 << 20, a.busy_poll);
+        if (a.kernel_ts && !net::enable_rx_timestamps(fd_)) std::fprintf(stderr, "exchange: kernel timestamps unavailable\n");
         start_idx_ = a.start.empty() ? 1 : first_index_at(msgs_, parse_hms(a.start));
         if (start_idx_ == 0) start_idx_ = 1;
         if (start_idx_ >= msgs_.size()) throw std::runtime_error("--start is after the last message");
@@ -311,16 +320,17 @@ public:
         uint64_t wall0 = util::now_ns(), next_print = 0, next_snap = 0;
         size_t next = start_idx_;
         const uint64_t lob0 = msgs_[start_idx_].ts_ns;
-        alignas(64) unsigned char buf[2048];
         while (!g_stop) {
-            // 1. drain order entry
-            for (int k = 0; k < 256; ++k) {
-                sockaddr_in from{};
-                socklen_t fl = sizeof(from);
-                const ssize_t n = ::recvfrom(fd_, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &fl);
-                if (n < 0) break;
-                const uint64_t t_rx = util::now_ns();
-                if (n == ssize_t(MSG_SIZE)) receive(buf, from, t_rx);
+            // 1. drain order entry (recvmmsg batches on Linux). Arrival time = the kernel's receive
+            //    timestamp with --kernel-ts, else the moment we read it.
+            for (int k = 0; k < 4; ++k) {
+                const int n = rx_.recv_batch(fd_, rxb_, net::MAX_BATCH);
+                if (n <= 0) break;
+                const uint64_t t_user = util::now_ns();
+                for (int i = 0; i < n; ++i)
+                    if (rxb_[i].len == ssize_t(MSG_SIZE))
+                        receive(rxb_[i].buf, rxb_[i].from, rxb_[i].kernel_ts ? rxb_[i].kernel_ts : t_user);
+                if (n < net::MAX_BATCH) break;
             }
             const uint64_t now = util::now_ns();
             release_held(now);
@@ -541,9 +551,13 @@ private:
         last_ = t;
         SeqInfo& si = seqs_[t.seq % RING];
         si = SeqInfo{t.seq, 0, 0, false};
-        // fairness: rotate which contestant gets each update first
+        // fairness: rotate which contestant is sent each MARKET update first. The rotation counter
+        // advances only on market updates: rotating on seq would be biased, because each market
+        // event is followed by contestant-caused updates, so market events would keep landing on
+        // the same seq parity and always favour the same contestant.
         const size_t n = contestants_.size();
-        for (size_t k = 0; k < n; ++k) send_tob(contestants_[(t.seq + k) % n], t, true);
+        const uint64_t r = type == MSG_TOB ? rot_++ : rot_;
+        for (size_t k = 0; k < n; ++k) send_tob(contestants_[(r + k) % n], t, true);
     }
 
     void send_tob(Contestant& c, const Tob& t, bool record) {
@@ -684,6 +698,7 @@ private:
     std::vector<Contestant> contestants_;
     std::vector<SeqInfo> seqs_ = std::vector<SeqInfo>(RING);
     uint32_t seq_ = 0;
+    uint64_t rot_ = 0;
     Tob last_{};
     FILE* stats_f_ = nullptr;
     FILE* olog_ = nullptr;
@@ -693,6 +708,8 @@ private:
     // live scoreboard
     web::Shared shared_;
     std::unique_ptr<web::Server> http_;
+    net::Receiver rx_;
+    net::Rx rxb_[net::MAX_BATCH];
     std::vector<std::deque<Held>> held_;
     std::string symbol_;
     bool finished_ = false;
@@ -711,6 +728,9 @@ int main(int argc, char** argv) {
         if (a.mode == "verify") return run_verify(a);
         if (a.mode == "bench") return run_bench(a);
         if (a.mode == "run") {
+            if (a.kernel_ts) util::use_realtime_clock(true);
+            const std::string rt = util::realtime_setup(a.rt, a.mlock);
+            if (!rt.empty()) std::printf("exchange: %s\n", rt.c_str());
             auto ex = std::make_unique<Exchange>(a);   // large (per-contestant rings): keep off the stack
             return ex->run();
         }

@@ -20,6 +20,7 @@ make test       # matching-engine unit tests
 make verify     # replay a day with no contestants, compare against LOBSTER's own book
 make bench      # matching-engine throughput and per-message latency
 make race       # exchange + two CPU contestants (one with a 20 µs handicap) on this machine
+make linux      # Linux build + tests in Docker (LINUX_IMAGE=any image with g++ and make)
 ./scripts/demo.sh   # live demo: two identical CPU contestants on AAPL, scoreboard at http://localhost:8080
 ```
 
@@ -32,7 +33,7 @@ handicap per contestant), `OUT`, and `ORDER_LOG=1` for a per-order CSV. Outputs:
 ./build/exchange run --messages FILE [--start 10:00:00] [--speed 1] [--duration 60] [--wait 2]
                      [--port 9000] [--stats f.jsonl] [--summary f.json] [--order-log f.csv] [--core N]
 ./build/trader --name cpu --exchange 127.0.0.1:9000 [--delay-ns 0] [--qty 100] [--max-pos 500]
-               [--keep-ticks 1] [--core N]
+               [--keep-ticks 1] [--core N] [--rt PRIO] [--mlock] [--busy-poll US] [--kernel-ts]
 ```
 
 ## Live scoreboard (`ui/scoreboard.html`, `include/http.hpp`)
@@ -126,14 +127,78 @@ Races at 10× replay speed from 10:00, 30 s each. "Fast" has no handicap; "slow"
 The ~70 µs median reaction time is mostly macOS's UDP stack: a bare loopback round trip on this Mac is 86 µs.
 Deciding takes nanoseconds, and each `sendto` costs ~3 µs.
 
-## Toward phases 2 and 3
+## Phase 2: the CPU contestant on Linux
 
-* **Linux and real NICs.** Run the exchange on its own box with one 10G port per contestant and equal-length cables.
-  Timestamp arrivals with the NIC (`SO_TIMESTAMPING`, hardware), pin the exchange (`--core`) to an isolated CPU,
-  and set `SO_BUSY_POLL` (already set where available). Kernel bypass (AF_XDP, DPDK, ef_vi) is next for both the
-  exchange and the CPU contestant.
-* **FPGA contestant.** It implements the same 32-byte messages: send one fixed `Hello`, parse `0x10`/`0x11` `Tob`s
-  (offsets 4–31), run the quote logic, and emit `NewOrder`/`Cancel` with `trigger_seq` copied from the `Tob`.
-  The strategy is the same as `src/trader.cpp`.
-* **Known limits.** The exchange is single-threaded, and each `sendto` costs ~3 µs on macOS, so very high replay
-  speeds or many contestants can delay the feed. Use `SPEED` ≤ 30 here, or move to Linux or kernel bypass.
+### What changed
+
+| | before | now |
+|---|---|---|
+| Trader sockets | separate market-data and order sockets, polled in turn | **one socket** for market data, orders and replies: one receive call per loop |
+| Receive | one `recv` per datagram | `recvmmsg` batch on Linux |
+| Send | one `sendto` per order | cancel + new order in **one `sendmmsg`**, on a connected socket (no per-send address lookup) |
+| Hot path | build each message on the fly | decide, fill fixed 32-byte buffers, one send. No allocation, no locks, no logging |
+| Arrival time at the exchange | when the exchange loop read the packet | optional **kernel receive timestamp** (`--kernel-ts`), so the exchange's own loop is not charged to the contestant |
+| Fairness | send order rotated by sequence number | rotated by a **market-event counter**. The old rotation always served the same contestant first, because each market event is followed by contestant-caused updates (this showed as a 57/43 split on Linux) |
+| Self-measurement | none | the trader reports its tick-to-trade (kernel receive timestamp → orders handed to the kernel), kernel → user time and send-syscall cost |
+
+Latency switches, the same for `trader`, `exchange run` and `udp_pingpong`:
+
+| flag | effect | notes |
+|---|---|---|
+| `--core N` | pin to a CPU | pair with `isolcpus`/`nohz_full` |
+| `--busy-poll US` | `SO_BUSY_POLL`: the kernel spins on the NIC queue | the exchange defaults to 50 |
+| `--kernel-ts` | kernel receive timestamps; the whole process switches to `CLOCK_REALTIME` | in the trader: tick-in = kernel timestamp |
+| `--rt PRIO` | `SCHED_FIFO` | **only on isolated cores**: on a shared core a spinning real-time thread starves the kernel's network work (p99 went from 3 µs to 65 µs in our VM) |
+| `--mlock` | lock all memory: no page faults on the hot path | needs an unlimited memlock limit |
+
+`tools/linux_tune.sh` checks a host against everything that matters for tail latency: CPU isolation boot parameters,
+irqbalance and NIC interrupt placement, frequency governor and idle states, busy-poll sysctls, NIC interrupt coalescing
+and GRO/LRO, transparent hugepages, socket buffers, memlock and real-time safety. It's a dry run by default.
+`sudo tools/linux_tune.sh --apply --iface eth1` applies the runtime items. It never edits boot settings; it prints the kernel command line to add instead.
+
+`tools/udp_pingpong` measures the network floor with the same socket options (`--local`, or `--server`/`--client`
+across two machines). Run it before racing: no contestant can beat it.
+
+### Measured (Linux 7.0 in Docker on the M1, loopback, 8 vCPUs)
+
+`make linux` builds and runs the tests in Docker. The races are `scripts/race.sh` with `BIN=build-linux` and the flags shown,
+on AAPL from 10:00, 30 s at 10× speed:
+
+| | median reaction | p99 | p99.9 | race split |
+|---|---|---|---|---|
+| macOS, for reference | 62–78 µs | 230–690 µs | | |
+| Linux, no tuning | 7.4–7.7 µs | 57–90 µs | 1.4–2.6 ms | 55 / 45 (identical engines) |
+| Linux, exchange + both contestants tuned (`--core --busy-poll 50 --kernel-ts`) | **2.4–2.8 µs** | **11–14 µs** | **20–36 µs** | 48 / 52 (identical engines) |
+| tuned vs untuned contestant | 2.8 vs 2.6 µs | 23 vs 16 µs | **139 µs vs 5.4 ms** | 48 / 52 |
+
+Inside the tuned trader: deciding takes 83–211 ns. Kernel receive → orders handed back to the kernel takes ~1.1 µs at the median.
+Loopback UDP round trip: 2.6 µs median, with p99 2.9 µs once busy polling is on (27 µs without).
+
+What this shows:
+
+* **The median is now set by the kernel network stack, not by our code.** Reaction is ~2.5 µs against a 2.6 µs loopback
+  round trip, and our own decision is ~0.1–0.2 µs of that.
+* **Tuning buys the tail.** p99.9 drops from milliseconds to tens of µs. On this idle VM an untuned process
+  gets the same median, because nothing competes for its core. On a loaded host, pinning and isolation keep the median too.
+* **This is a VM.** The remaining p99/p99.9 is mostly hypervisor scheduling noise. Bare metal with `isolcpus` and
+  the tuning script applied is the real test.
+
+### Next steps (need Linux hardware)
+
+1. **Two machines, real NICs.** Exchange on its own box (`--host 0.0.0.0`), contestant on another, equal cable lengths,
+   both tuned with `tools/linux_tune.sh`. Measure the floor with `udp_pingpong --server/--client` first.
+2. **Kernel bypass, the biggest remaining step** (~1 µs per direction → a few hundred ns):
+   * **OpenOnload** on AMD/Solarflare NICs: `onload --profile=latency ./build/trader ...`. No code change; it
+     intercepts the socket calls this code already uses.
+   * **AF_XDP** on most modern NICs (Intel, Mellanox): a new transport behind `net.hpp`'s two functions.
+   * **DPDK or ef_vi**: lowest latency, the most work.
+3. **NIC hardware timestamps** at the exchange (`SO_TIMESTAMPING` RX/TX hardware) for judging with nanosecond accuracy.
+
+## Phase 3: FPGA contestant
+
+It implements the same 32-byte messages: send one fixed `Hello`, parse `0x10`/`0x11` `Tob`s (offsets 4–31), run the
+quote logic, and send `NewOrder`/`Cancel` with `trigger_seq` copied from the `Tob`. The strategy is the same as
+`src/trader.cpp`. It can use the scoreboard's latency slider without any FPGA changes.
+
+**Known limits.** The exchange is single-threaded, and each `sendto` costs ~3 µs on macOS (~1 µs on Linux), so very high replay
+speeds or many contestants can delay the feed. Use `SPEED` ≤ 30 on macOS.

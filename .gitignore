@@ -12,3 +12,4 @@ fpga/vivado/overlay/
 .DS_Store
 .claude/
 exchange/build/
+exchange/build-linux/
