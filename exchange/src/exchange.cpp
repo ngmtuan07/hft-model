@@ -2,6 +2,7 @@
 //
 //   exchange run    --messages <LOBSTER message file> [--start 10:00:00] [--duration 60] [--speed 1]
 //                   [--port 9000] [--wait 2] [--stats out.jsonl] [--summary out.json] [--core N]
+//                   [--http 8080 [--ui ui/scoreboard.html]]     live scoreboard at http://localhost:8080
 //   exchange verify --messages <file>          replay with no contestants; compare our top of book
 //                                              with LOBSTER's after every message
 //   exchange bench  --messages <file> [--reps 5]  matching-engine throughput and per-message latency
@@ -11,6 +12,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -19,6 +21,7 @@
 #include <vector>
 
 #include "book.hpp"
+#include "http.hpp"
 #include "lobster.hpp"
 #include "proto.hpp"
 #include "util.hpp"
@@ -31,11 +34,11 @@ volatile std::sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
 
 struct Args {
-    std::string mode, messages, stats, summary, order_log, host = "127.0.0.1";
+    std::string mode, messages, stats, summary, order_log, host = "127.0.0.1", ui = "ui/scoreboard.html";
     std::string start;              // HH:MM:SS of the trading day; default: first message
     double duration = 60.0;         // wall seconds of replay
     double speed = 1.0;             // 1 = real time, 0 = as fast as possible
-    int port = 9000, wait = 0, reps = 5, core = -1, max_contestants = 8;
+    int port = 9000, wait = 0, reps = 5, core = -1, max_contestants = web::MAX_CONTESTANTS, http = 0;
     bool no_reconcile = false;      // replay messages only, without snapping to LOBSTER snapshots
 };
 
@@ -59,6 +62,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--reps") a.reps = std::atoi(v().c_str());
         else if (k == "--core") a.core = std::atoi(v().c_str());
         else if (k == "--no-reconcile") a.no_reconcile = true;
+        else if (k == "--http") a.http = std::atoi(v().c_str());
+        else if (k == "--ui") a.ui = v();
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
     }
     if (a.messages.empty()) { std::fprintf(stderr, "--messages is required\n"); std::exit(2); }
@@ -247,7 +252,16 @@ struct Contestant {
     int64_t markout_x2 = 0;              // sum of side*(mid_1s - px)*qty, in half-ticks (mid can be x.5)
     uint64_t markout_qty = 0;
     util::Histogram lat, lat_window, oe_oneway;   // oe_oneway: same-host only (shared clock)
+    static constexpr int SLOTS = 5;               // rolling 1 s window = 5 snapshot slots of 0.2 s
+    util::Histogram lat_slot[SLOTS];
+    int slot = 0;
+    static constexpr int DISP_BINS = 50;          // display histogram: 10 bins/decade, 100 ns .. 10 ms
+    uint32_t disp[DISP_BINS] = {};
+    uint64_t recent_wins = 0;                     // wins among the last RECENT races (any contestant)
 };
+
+// An order held back by the latency slider (as if its cable were longer).
+struct Held { uint64_t release; sockaddr_in from; unsigned char buf[MSG_SIZE]; };
 
 struct PendingMarkout { uint64_t due_hist_ns; uint32_t owner; int8_t sgn; me::Px px; me::Qty qty; };
 
@@ -265,6 +279,14 @@ public:
         if (start_idx_ >= msgs_.size()) throw std::runtime_error("--start is after the last message");
         rp_.seed(lob::read_row(lob::orderbook_path(a.messages), start_idx_ - 1));
         if (!a.stats.empty()) stats_f_ = std::fopen(a.stats.c_str(), "w");
+        symbol_ = a.messages.substr(a.messages.find_last_of('/') + 1);
+        symbol_ = symbol_.substr(0, symbol_.find('_'));
+        held_.resize(web::MAX_CONTESTANTS);
+        if (a.http) {
+            shared_.ui_path = a.ui;
+            http_ = std::make_unique<web::Server>(a.http, &shared_);
+            if (http_->ok()) std::printf("exchange: scoreboard at http://localhost:%d\n", a.http);
+        }
         if (!a.order_log.empty()) {
             olog_ = std::fopen(a.order_log.c_str(), "w");
             if (olog_) std::fprintf(olog_, "t_ns,contestant,msg,coid,side,price,qty,trigger_seq,result,bid,bid_qty,ask,ask_qty\n");
@@ -286,7 +308,7 @@ public:
         if (util::pin_to_core(args_.core)) std::printf("exchange: pinned to core %d\n", args_.core);
         publish_if_changed();
         bool started = args_.wait == 0;
-        uint64_t wall0 = util::now_ns(), next_print = 0;
+        uint64_t wall0 = util::now_ns(), next_print = 0, next_snap = 0;
         size_t next = start_idx_;
         const uint64_t lob0 = msgs_[start_idx_].ts_ns;
         alignas(64) unsigned char buf[2048];
@@ -298,9 +320,15 @@ public:
                 const ssize_t n = ::recvfrom(fd_, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &fl);
                 if (n < 0) break;
                 const uint64_t t_rx = util::now_ns();
-                if (n == ssize_t(MSG_SIZE)) handle(buf, from, t_rx);
+                if (n == ssize_t(MSG_SIZE)) receive(buf, from, t_rx);
             }
             const uint64_t now = util::now_ns();
+            release_held(now);
+            if (shared_.reset.exchange(false)) reset_stats();
+            if (http_ && now >= next_snap) {
+                snapshot(started ? double(now - wall0) / 1e9 : 0.0, next < msgs_.size() ? msgs_[next].ts_ns : msgs_.back().ts_ns, started);
+                next_snap = now + 200000000ull;
+            }
             if (!started) {
                 if (int(contestants_.size()) >= args_.wait) { started = true; wall0 = now; std::printf("exchange: start\n"); }
                 else continue;
@@ -332,6 +360,7 @@ public:
         }
         const double el = double(util::now_ns() - wall0) / 1e9;
         scoreboard(el, next < msgs_.size() ? msgs_[next].ts_ns : msgs_.back().ts_ns);
+        if (http_) { finished_ = true; snapshot(el, msgs_.back().ts_ns, true); }
         summary(el, next - start_idx_);
         if (stats_f_) std::fclose(stats_f_);
         if (olog_) std::fclose(olog_);
@@ -339,6 +368,39 @@ public:
     }
 
 private:
+    // Entry point for every datagram: apply the contestant's extra latency (slider) if any.
+    void receive(const unsigned char* buf, const sockaddr_in& from, uint64_t t_rx) {
+        if (Contestant* c = by_addr(from)) {
+            auto& q = held_[c->id - 1];
+            const int64_t extra = shared_.extra_ns[c->id - 1].load(std::memory_order_relaxed);
+            if (extra > 0 || !q.empty()) {          // keep a contestant's own messages in order
+                Held h;
+                h.release = t_rx + uint64_t(extra > 0 ? extra : 0);
+                if (!q.empty() && q.back().release > h.release) h.release = q.back().release;
+                h.from = from;
+                std::memcpy(h.buf, buf, MSG_SIZE);
+                q.push_back(h);
+                return;
+            }
+        }
+        handle(buf, from, t_rx);
+    }
+
+    // Deliver held messages whose time has come, earliest first across contestants. Their
+    // arrival time (for judging and latency) is the release time.
+    void release_held(uint64_t now) {
+        while (true) {
+            int best = -1;
+            uint64_t bt = ~0ull;
+            for (int i = 0; i < web::MAX_CONTESTANTS; ++i)
+                if (!held_[i].empty() && held_[i].front().release <= now && held_[i].front().release < bt) { bt = held_[i].front().release; best = i; }
+            if (best < 0) return;
+            const Held h = held_[best].front();
+            held_[best].pop_front();
+            handle(h.buf, h.from, h.release);
+        }
+    }
+
     void handle(const unsigned char* buf, const sockaddr_in& from, uint64_t t_rx) {
         uint16_t type;
         std::memcpy(&type, buf, 2);
@@ -388,10 +450,28 @@ private:
         const uint32_t bit = 1u << c.id;
         if (si.mask & bit) return;                 // only the first reaction counts
         const uint64_t sent = c.md_sent_ts[s % RING];
-        if (sent && t_rx > sent) { c.lat.add(t_rx - sent); c.lat_window.add(t_rx - sent); }
+        if (sent && t_rx > sent) {
+            const uint64_t d = t_rx - sent;
+            c.lat.add(d);
+            c.lat_window.add(d);
+            c.lat_slot[c.slot].add(d);
+            int b = int(std::floor(10.0 * std::log10(double(d)) - 20.0));   // 100 ns = bin 0
+            b = b < 0 ? 0 : (b >= Contestant::DISP_BINS ? Contestant::DISP_BINS - 1 : b);
+            ++c.disp[b];
+        }
         if (si.mask == 0) { si.first = c.id; }
         else {
-            if (!si.raced) { auto& f = contestants_[si.first - 1]; ++f.races; ++f.wins; si.raced = true; }
+            if (!si.raced) {
+                auto& f = contestants_[si.first - 1];
+                ++f.races;
+                ++f.wins;
+                si.raced = true;
+                // rolling window of the last RECENT race winners
+                if (recent_n_ == RECENT) { --contestants_[recent_[recent_i_] - 1].recent_wins; } else ++recent_n_;
+                recent_[recent_i_] = uint8_t(si.first);
+                recent_i_ = (recent_i_ + 1) % RECENT;
+                ++f.recent_wins;
+            }
             ++c.races;
         }
         si.mask |= bit;
@@ -502,6 +582,65 @@ private:
         for (auto& c : contestants_) { c.fills_last = c.fills; c.lat_window.reset(); }
     }
 
+    void reset_stats() {
+        for (auto& c : contestants_) {
+            c.orders = c.cancels = c.rejects = c.fills = c.fill_qty = c.races = c.wins = 0;
+            c.fills_last = c.first_fills = c.markout_qty = c.recent_wins = 0;
+            c.markout_x2 = 0;
+            c.lat.reset(); c.lat_window.reset(); c.oe_oneway.reset();
+            for (auto& h : c.lat_slot) h.reset();
+            std::memset(c.disp, 0, sizeof(c.disp));
+        }
+        recent_n_ = recent_i_ = 0;
+        std::printf("exchange: statistics reset from the scoreboard\n");
+        std::fflush(stdout);
+    }
+
+    // JSON for the live scoreboard (published ~5x per second; see include/http.hpp).
+    void snapshot(double el, uint64_t lob_ts, bool started) {
+        std::string s;
+        s.reserve(4096);
+        char b[1024];
+        std::snprintf(b, sizeof(b),
+                      "{\"t\": %.3f, \"started\": %s, \"finished\": %s, \"waiting_for\": %d, \"symbol\": \"%s\", \"speed\": %.2f, "
+                      "\"replay\": \"%s\", \"seq\": %u, \"bid\": %u, \"bid_qty\": %u, \"ask\": %u, \"ask_qty\": %u, "
+                      "\"recent_races\": %d, \"hist_lo_ns\": 100, \"bins_per_decade\": 10, \"contestants\": [",
+                      el, started ? "true" : "false", finished_ ? "true" : "false",
+                      started ? 0 : args_.wait - int(contestants_.size()), symbol_.c_str(), args_.speed,
+                      hms(lob_ts).c_str(), seq_, last_.bid, last_.bid_qty, last_.ask, last_.ask_qty, recent_n_);
+        s += b;
+        const double mid = (double(last_.bid) + double(last_.ask)) / 2.0;
+        for (size_t i = 0; i < contestants_.size(); ++i) {
+            auto& c = contestants_[i];
+            util::Histogram win;                      // last ~1 s of reactions
+            for (const auto& h : c.lat_slot) win.merge(h);
+            std::snprintf(b, sizeof(b),
+                          "%s{\"id\": %u, \"name\": \"%s\", \"races\": %llu, \"wins\": %llu, \"recent_wins\": %llu, "
+                          "\"fills\": %llu, \"first_fills\": %llu, \"fill_qty\": %llu, \"orders\": %llu, \"cancels\": %llu, "
+                          "\"rejects\": %llu, \"position\": %lld, \"pnl_usd\": %.2f, \"markout_ticks\": %.3f, "
+                          "\"lat_n\": %llu, \"p50\": %llu, \"p99\": %llu, \"p999\": %llu, \"max\": %llu, "
+                          "\"win_n\": %llu, \"win_p50\": %llu, \"win_p99\": %llu, \"extra_ns\": %lld, \"hist\": [",
+                          i ? ", " : "", c.id, c.name.c_str(), (unsigned long long)c.races, (unsigned long long)c.wins,
+                          (unsigned long long)c.recent_wins, (unsigned long long)c.fills, (unsigned long long)c.first_fills,
+                          (unsigned long long)c.fill_qty, (unsigned long long)c.orders, (unsigned long long)c.cancels,
+                          (unsigned long long)c.rejects, (long long)c.position,
+                          last_.bid && last_.ask ? (double(c.cash) + double(c.position) * mid) / 100.0 : 0.0,
+                          c.markout_qty ? double(c.markout_x2) / 2.0 / double(c.markout_qty) : 0.0,
+                          (unsigned long long)c.lat.count(), (unsigned long long)c.lat.percentile(50),
+                          (unsigned long long)c.lat.percentile(99), (unsigned long long)c.lat.percentile(99.9),
+                          (unsigned long long)c.lat.max(), (unsigned long long)win.count(),
+                          (unsigned long long)win.percentile(50), (unsigned long long)win.percentile(99),
+                          (long long)shared_.extra_ns[c.id - 1].load());
+            s += b;
+            for (int k = 0; k < Contestant::DISP_BINS; ++k) { s += k ? "," : ""; s += std::to_string(c.disp[k]); }
+            s += "]}";
+            c.slot = (c.slot + 1) % Contestant::SLOTS;
+            c.lat_slot[c.slot].reset();
+        }
+        s += "]}";
+        shared_.publish(std::move(s));
+    }
+
     void summary(double el, size_t replayed) {
         std::string s = "{\"wall_s\": " + std::to_string(el) + ", \"history_messages\": " + std::to_string(replayed) +
                         ", \"tob_updates\": " + std::to_string(seq_) + ", \"contestants\": [";
@@ -551,6 +690,15 @@ private:
     static constexpr uint64_t MARKOUT_NS = 1000000000ull;
     uint64_t hist_now_ = 0;
     std::deque<PendingMarkout> pending_;
+    // live scoreboard
+    web::Shared shared_;
+    std::unique_ptr<web::Server> http_;
+    std::vector<std::deque<Held>> held_;
+    std::string symbol_;
+    bool finished_ = false;
+    static constexpr int RECENT = 100;
+    uint8_t recent_[RECENT] = {};
+    int recent_n_ = 0, recent_i_ = 0;
 };
 
 }  // namespace

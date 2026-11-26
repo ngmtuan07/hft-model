@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HFT Race Scoreboard</title>
+<style>
+  :root {
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --surface-2: #242422;
+    --grid: #33332f;
+    --axis: #55554f;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #9a998f;
+    --good: #2fb36d;
+    --warn: #c98500;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --surface-0: #f3f2ee;
+      --surface-1: #fcfcfb;
+      --surface-2: #ffffff;
+      --grid: #e6e5e0;
+      --axis: #b9b8b2;
+      --text-primary: #0b0b0b;
+      --text-secondary: #52514e;
+      --text-muted: #6b6a66;
+      --good: #138a4b;
+      --warn: #9a6500;
+      --series-1: #2a78d6;
+      --series-2: #eb6834;
+      --series-3: #1baf7a;
+      --series-4: #eda100;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--surface-0); color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; }
+  body { padding: 20px 24px 28px; }
+  .num { font-variant-numeric: tabular-nums; }
+  header { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; margin-bottom: 18px; }
+  h1 { font-size: 28px; margin: 0; letter-spacing: 0.04em; }
+  .meta { color: var(--text-secondary); font-size: 16px; }
+  .pill { font-size: 14px; padding: 3px 10px; border-radius: 999px; background: var(--surface-2); color: var(--text-secondary); }
+  .pill .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--text-muted); }
+  .pill.live .dot { background: var(--good); }
+  .pill.wait .dot { background: var(--warn); }
+  .spacer { flex: 1; }
+  button { background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--grid); border-radius: 8px;
+    padding: 7px 14px; font-size: 14px; cursor: pointer; }
+  button:hover { border-color: var(--axis); }
+
+  .panel { background: var(--surface-1); border-radius: 14px; padding: 18px 20px; }
+  .label { color: var(--text-secondary); font-size: 14px; letter-spacing: 0.04em; text-transform: uppercase; }
+
+  /* hero: races won */
+  .hero { margin-bottom: 16px; }
+  .hero-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin: 6px 0 12px; }
+  .hero-side { display: flex; align-items: baseline; gap: 12px; }
+  .hero-side.right { flex-direction: row-reverse; text-align: right; }
+  .hero-pct { font-size: 64px; font-weight: 700; line-height: 1; }
+  .hero-name { font-size: 24px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .swatch { width: 14px; height: 14px; border-radius: 4px; display: inline-block; }
+  .bar { display: flex; gap: 2px; height: 34px; border-radius: 6px; overflow: hidden; background: var(--surface-2); }
+  .bar.small { height: 12px; }
+  .bar .seg { height: 100%; transition: flex-grow 0.4s ease; min-width: 0; }
+  .hero-sub { display: flex; justify-content: space-between; color: var(--text-secondary); font-size: 15px; margin-top: 8px; gap: 12px; flex-wrap: wrap; }
+  .recent { display: grid; grid-template-columns: 160px 1fr; align-items: center; gap: 12px; margin-top: 12px; color: var(--text-secondary); font-size: 14px; }
+
+  /* contestant cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .card-head { display: flex; align-items: center; gap: 10px; font-size: 22px; font-weight: 600; margin-bottom: 14px; }
+  .card-head .sub { font-size: 14px; font-weight: 400; color: var(--text-muted); }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 18px; }
+  .stat .v { font-size: 34px; font-weight: 650; line-height: 1.1; }
+  .stat .v.small { font-size: 24px; }
+  .stat .k { color: var(--text-secondary); font-size: 13px; margin-top: 2px; }
+  .slider { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--grid); }
+  .slider-row { display: flex; align-items: center; gap: 12px; }
+  .slider-row input { flex: 1; accent-color: var(--text-secondary); }
+  .slider-val { min-width: 88px; text-align: right; font-size: 20px; font-weight: 600; }
+  .slider-note { color: var(--text-muted); font-size: 13px; margin-top: 6px; }
+
+  /* charts */
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .chart-title { font-size: 18px; font-weight: 600; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--text-secondary); font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .ln { width: 18px; height: 0; border-top: 2px solid; display: inline-block; }
+  .legend .ln.dash { border-top-style: dashed; }
+  .chart-wrap { position: relative; }
+  svg { width: 100%; height: auto; display: block; overflow: visible; }
+  svg text { fill: var(--text-muted); font-size: 12px; font-family: inherit; }
+  .tip { position: absolute; pointer-events: none; background: var(--surface-2); border: 1px solid var(--grid); border-radius: 8px;
+    padding: 8px 10px; font-size: 13px; color: var(--text-primary); white-space: nowrap; display: none; z-index: 2;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
+  .tip .row { display: flex; align-items: center; gap: 6px; }
+  .note { color: var(--text-muted); font-size: 13px; margin-top: 8px; }
+
+  details { margin-top: 16px; }
+  summary { cursor: pointer; color: var(--text-secondary); font-size: 14px; }
+  table { border-collapse: collapse; margin-top: 10px; font-size: 14px; width: 100%; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--text-secondary); font-weight: 500; }
+  .empty { color: var(--text-muted); font-size: 18px; padding: 24px 0; text-align: center; }
+  @media (max-width: 600px) {
+    body { padding: 14px 16px 22px; }
+    .hero-pct { font-size: 44px; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .charts { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>HFT RACE</h1>
+  <div class="meta num" id="meta">connecting…</div>
+  <span class="pill" id="status"><span class="dot"></span><span id="status-text">connecting</span></span>
+  <div class="spacer"></div>
+  <button id="reset" title="Zero races, fills and latency statistics">Reset stats</button>
+</header>
+
+<section class="panel hero">
+  <div class="label">Races won: who reacted first to the same market event</div>
+  <div id="hero"><div class="empty">Waiting for contestants…</div></div>
+</section>
+
+<section class="cards" id="cards"></section>
+
+<section class="charts">
+  <div class="panel">
+    <div class="chart-head">
+      <div class="chart-title">Reaction latency distribution</div>
+      <div class="legend" id="hist-legend"></div>
+    </div>
+    <div class="chart-wrap" id="hist-wrap"><svg id="hist" viewBox="0 0 640 260" role="img" aria-label="Reaction latency histogram per contestant"></svg><div class="tip" id="hist-tip"></div></div>
+    <div class="note">Market data sent → order received, on the exchange clock. Solid line = median (p50), dashed = p99.</div>
+  </div>
+  <div class="panel">
+    <div class="chart-head">
+      <div class="chart-title">Reaction latency over time</div>
+      <div class="legend" id="time-legend"></div>
+    </div>
+    <div class="chart-wrap" id="time-wrap"><svg id="time" viewBox="0 0 640 260" role="img" aria-label="Median and p99 reaction latency over the last 90 seconds"></svg><div class="tip" id="time-tip"></div></div>
+    <div class="note">Rolling 1 s median (solid) and p99 (dashed), last 90 s. Log scale.</div>
+  </div>
+</section>
+
+<details>
+  <summary>Table view</summary>
+  <table id="table"></table>
+</details>
+
+<script>
+"use strict";
+const STEPS_US = [0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+const HISTORY_S = 90;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const colorOf = id => `var(--series-${((id - 1) % 4) + 1})`;
+const $ = id => document.getElementById(id);
+
+function fmtNs(ns) {
+  if (!ns && ns !== 0) return "–";
+  if (ns < 1000) return `${Math.round(ns)} ns`;
+  if (ns < 1e6) return `${(ns / 1e3).toFixed(ns < 1e4 ? 2 : 1)} µs`;
+  return `${(ns / 1e6).toFixed(2)} ms`;
+}
+function fmtUs(us) { return us === 0 ? "0 µs" : us >= 1000 ? `${us / 1000} ms` : `${us} µs`; }
+const fmtInt = n => n.toLocaleString("en-US");
+const pct = (a, b) => (b > 0 ? (100 * a) / b : 0);
+
+// ---------- client-side history (rates and time series) ----------
+let history = [];               // {t, byId: {id: {fills, p50, p99, n}}}
+let dragging = {};              // slider ids being dragged by this viewer
+let lastSnap = null;
+
+function remember(s) {
+  const now = performance.now() / 1000;
+  const byId = {};
+  for (const c of s.contestants) byId[c.id] = { fills: c.fills, p50: c.win_n ? c.win_p50 : null, p99: c.win_n ? c.win_p99 : null };
+  history.push({ t: now, byId });
+  while (history.length && now - history[0].t > HISTORY_S) history.shift();
+}
+function fillRate(id, windowS = 10) {
+  if (history.length < 2) return 0;
+  const last = history[history.length - 1];
+  let first = history[0];
+  for (const h of history) if (last.t - h.t <= windowS) { first = h; break; }
+  const a = first.byId[id], b = last.byId[id];
+  if (!a || !b || last.t <= first.t) return 0;
+  return Math.max(0, (b.fills - a.fills) / (last.t - first.t));
+}
+
+// ---------- header ----------
+function renderHeader(s) {
+  const px = v => (v ? (v / 100).toFixed(2) : "–");
+  $("meta").textContent = `${s.symbol} · replay ${s.replay} · ${s.speed}× speed · bid ${px(s.bid)} × ask ${px(s.ask)}`;
+  const st = $("status");
+  st.className = "pill " + (s.finished ? "" : s.started ? "live" : "wait");
+  $("status-text").textContent = s.finished ? "finished" : s.started ? "live" : `waiting for ${Math.max(1, s.waiting_for)} more`;
+}
+
+// ---------- hero ----------
+function renderHero(s) {
+  const cs = s.contestants;
+  const totalWins = cs.reduce((a, c) => a + c.wins, 0);
+  const races = cs.length ? Math.max(...cs.map(c => c.races)) : 0;
+  if (cs.length < 2 || races === 0) {
+    $("hero").innerHTML = `<div class="empty">${cs.length < 2 ? "Waiting for contestants…" : "No contested races yet: waiting for both to react to the same event"}</div>`;
+    return;
+  }
+  // positions and colours follow the contestant, never the rank: the leader can change sides
+  const ranked = cs.slice().sort((a, b) => a.id - b.id);
+  const side = (c, cls) => `<div class="hero-side ${cls}"><div class="hero-pct num">${pct(c.wins, totalWins).toFixed(0)}%</div>
+      <div class="hero-name"><span class="swatch" style="background:${colorOf(c.id)}"></span>${esc(c.name)}</div></div>`;
+  const segs = (key, total) => cs.map(c => `<div class="seg" style="flex-grow:${Math.max(c[key], 0)};background:${colorOf(c.id)}" title="${esc(c.name)}: ${c[key]}"></div>`).join("") ||
+      `<div class="seg" style="flex-grow:1"></div>`;
+  const recentTotal = cs.reduce((a, c) => a + c.recent_wins, 0);
+  $("hero").innerHTML = `
+    <div class="hero-top">${side(ranked[0], "")}${cs.length === 2 ? side(ranked[1], "right") : ""}</div>
+    <div class="bar" aria-label="Share of races won">${segs("wins", totalWins)}</div>
+    <div class="hero-sub num"><span>${fmtInt(totalWins)} contested races</span>
+      <span>${cs.map(c => `${esc(c.name)} ${fmtInt(c.wins)}`).join(" · ")}</span></div>
+    <div class="recent num"><span>Last ${recentTotal} races</span>
+      <div class="bar small">${segs("recent_wins", recentTotal)}</div></div>`;
+}
+
+// ---------- cards ----------
+function renderCards(s) {
+  const root = $("cards");
+  for (const c of s.contestants) {
+    let el = $(`card-${c.id}`);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "panel";
+      el.id = `card-${c.id}`;
+      el.innerHTML = `
+        <div class="card-head"><span class="swatch" style="background:${colorOf(c.id)}"></span><span class="nm"></span><span class="sub">contestant ${c.id}</span></div>
+        <div class="stats">
+          <div class="stat"><div class="v num" data-k="wins"></div><div class="k">races won</div></div>
+          <div class="stat"><div class="v num" data-k="p50"></div><div class="k">median reaction</div></div>
+          <div class="stat"><div class="v num small" data-k="p99"></div><div class="k">p99 reaction</div></div>
+          <div class="stat"><div class="v num" data-k="fills"></div><div class="k">orders filled</div></div>
+          <div class="stat"><div class="v num" data-k="rate"></div><div class="k">fills / second</div></div>
+          <div class="stat"><div class="v num small" data-k="first"></div><div class="k">first-in-line fills</div></div>
+        </div>
+        <div class="slider">
+          <div class="label">Extra latency</div>
+          <div class="slider-row">
+            <input type="range" min="0" max="${STEPS_US.length - 1}" step="1" value="0" aria-label="Extra latency for ${esc(c.name)}">
+            <div class="slider-val num">0 µs</div>
+          </div>
+          <div class="slider-note">Held at the exchange before matching, like a longer cable.</div>
+        </div>`;
+      const input = el.querySelector("input"), val = el.querySelector(".slider-val");
+      input.addEventListener("input", () => { dragging[c.id] = true; val.textContent = fmtUs(STEPS_US[+input.value]); });
+      input.addEventListener("change", () => {
+        fetch(`/control?c=${c.id}&extra_us=${STEPS_US[+input.value]}`).finally(() => setTimeout(() => { dragging[c.id] = false; }, 400));
+      });
+      root.appendChild(el);
+    }
+    el.querySelector(".nm").textContent = c.name;
+    const set = (k, v) => { el.querySelector(`[data-k="${k}"]`).textContent = v; };
+    set("wins", fmtInt(c.wins));
+    set("p50", c.lat_n ? fmtNs(c.p50) : "–");
+    set("p99", c.lat_n ? fmtNs(c.p99) : "–");
+    set("fills", fmtInt(c.fills));
+    set("rate", fillRate(c.id).toFixed(1));
+    set("first", `${fmtInt(c.first_fills)} (${pct(c.first_fills, c.fills).toFixed(0)}%)`);
+    if (!dragging[c.id]) {
+      const us = c.extra_ns / 1000;
+      let idx = STEPS_US.indexOf(us);
+      if (idx < 0) idx = STEPS_US.reduce((b, v, i) => (Math.abs(v - us) < Math.abs(STEPS_US[b] - us) ? i : b), 0);
+      el.querySelector("input").value = idx;
+      el.querySelector(".slider-val").textContent = fmtUs(us);
+    }
+  }
+}
+
+// ---------- charts ----------
+const W = 640, H = 260, M = { l: 52, r: 14, t: 12, b: 34 };
+const iw = W - M.l - M.r, ih = H - M.t - M.b;
+const LO = 2, HI = 7;            // log10 ns axis: 100 ns .. 10 ms
+const xLog = ns => M.l + ((Math.log10(Math.max(ns, 10 ** LO)) - LO) / (HI - LO)) * iw;
+const DECADE_LABEL = { 2: "100 ns", 3: "1 µs", 4: "10 µs", 5: "100 µs", 6: "1 ms", 7: "10 ms" };
+
+function axisX(parts) {
+  for (let d = LO; d <= HI; d++) {
+    const x = xLog(10 ** d);
+    parts.push(`<line x1="${x}" x2="${x}" y1="${M.t}" y2="${M.t + ih}" stroke="var(--grid)" stroke-width="1"/>`);
+    parts.push(`<text x="${x}" y="${H - 12}" text-anchor="middle">${DECADE_LABEL[d]}</text>`);
+  }
+}
+
+function renderHist(s) {
+  const cs = s.contestants;
+  const bins = cs.length ? cs[0].hist.length : 50;
+  const shares = cs.map(c => { const tot = c.hist.reduce((a, b) => a + b, 0) || 1; return c.hist.map(v => (100 * v) / tot); });
+  const ymax = Math.max(5, ...shares.flat()) * 1.1;
+  const y = v => M.t + ih - (v / ymax) * ih;
+  const parts = [];
+  axisX(parts);
+  for (let k = 0; k <= 4; k++) {
+    const v = (ymax / 4) * k, yy = y(v);
+    parts.push(`<line x1="${M.l}" x2="${M.l + iw}" y1="${yy}" y2="${yy}" stroke="var(--grid)" stroke-width="1"/>`);
+    parts.push(`<text x="${M.l - 8}" y="${yy + 4}" text-anchor="end">${v.toFixed(0)}%</text>`);
+  }
+  const edge = k => 10 ** (LO + k / 10);
+  cs.forEach((c, i) => {
+    if (!c.lat_n) return;
+    let d = `M ${xLog(edge(0))} ${y(0)}`;
+    for (let k = 0; k < bins; k++) d += ` L ${xLog(edge(k))} ${y(shares[i][k])} L ${xLog(edge(k + 1))} ${y(shares[i][k])}`;
+    d += ` L ${xLog(edge(bins))} ${y(0)} Z`;
+    parts.push(`<path d="${d}" fill="${colorOf(c.id)}" fill-opacity="0.18" stroke="${colorOf(c.id)}" stroke-width="2" stroke-linejoin="round"/>`);
+    for (const [v, dash] of [[c.p50, ""], [c.p99, "5 4"]]) {
+      const x = xLog(v);
+      parts.push(`<line x1="${x}" x2="${x}" y1="${M.t}" y2="${M.t + ih}" stroke="${colorOf(c.id)}" stroke-width="2" ${dash ? `stroke-dasharray="${dash}"` : ""}/>`);
+    }
+  });
+  parts.push(`<rect id="hist-hit" x="${M.l}" y="${M.t}" width="${iw}" height="${ih}" fill="transparent"/>`);
+  $("hist").innerHTML = parts.join("");
+  $("hist-legend").innerHTML = cs.map(c => `<span><span class="swatch" style="background:${colorOf(c.id)}"></span>${esc(c.name)}</span>`).join("") +
+    `<span><span class="ln"></span>p50</span><span><span class="ln dash"></span>p99</span>`;
+  hover($("hist-wrap"), $("hist"), $("hist-tip"), px => {
+    const ns = 10 ** (LO + ((px - M.l) / iw) * (HI - LO));
+    const k = Math.min(bins - 1, Math.max(0, Math.floor(10 * Math.log10(ns) - 20)));
+    return `<div>${fmtNs(edge(k))} – ${fmtNs(edge(k + 1))}</div>` +
+      cs.map((c, i) => `<div class="row"><span class="swatch" style="background:${colorOf(c.id)}"></span>${esc(c.name)}: ${shares[i][k].toFixed(1)}% of reactions</div>`).join("");
+  });
+}
+
+function renderTime(s) {
+  const cs = s.contestants;
+  const now = history.length ? history[history.length - 1].t : 0;
+  const x = t => M.l + (1 - (now - t) / HISTORY_S) * iw;
+  const yLog = ns => M.t + ih - ((Math.log10(Math.max(ns, 10 ** LO)) - LO) / (HI - LO)) * ih;
+  const parts = [];
+  for (let d = LO; d <= HI; d++) {
+    const yy = yLog(10 ** d);
+    parts.push(`<line x1="${M.l}" x2="${M.l + iw}" y1="${yy}" y2="${yy}" stroke="var(--grid)" stroke-width="1"/>`);
+    parts.push(`<text x="${M.l - 8}" y="${yy + 4}" text-anchor="end">${DECADE_LABEL[d]}</text>`);
+  }
+  for (let sec = 0; sec <= HISTORY_S; sec += 30) {
+    const xx = M.l + (1 - sec / HISTORY_S) * iw;
+    parts.push(`<text x="${xx}" y="${H - 12}" text-anchor="middle">${sec === 0 ? "now" : `−${sec} s`}</text>`);
+  }
+  for (const c of cs) {
+    for (const [key, dash, w] of [["p99", "5 4", 1.5], ["p50", "", 2]]) {
+      let d = "", pen = false;
+      for (const h of history) {
+        const v = h.byId[c.id] && h.byId[c.id][key];
+        if (v == null) { pen = false; continue; }
+        d += `${pen ? "L" : "M"} ${x(h.t).toFixed(1)} ${yLog(v).toFixed(1)} `;
+        pen = true;
+      }
+      if (d) parts.push(`<path d="${d}" fill="none" stroke="${colorOf(c.id)}" stroke-width="${w}" ${dash ? `stroke-dasharray="${dash}" stroke-opacity="0.75"` : ""} stroke-linejoin="round" stroke-linecap="round"/>`);
+    }
+  }
+  parts.push(`<rect x="${M.l}" y="${M.t}" width="${iw}" height="${ih}" fill="transparent"/>`);
+  $("time").innerHTML = parts.join("");
+  $("time-legend").innerHTML = cs.map(c => `<span><span class="swatch" style="background:${colorOf(c.id)}"></span>${esc(c.name)}</span>`).join("") +
+    `<span><span class="ln"></span>median</span><span><span class="ln dash"></span>p99</span>`;
+  hover($("time-wrap"), $("time"), $("time-tip"), px => {
+    const t = now - (1 - (px - M.l) / iw) * HISTORY_S;
+    let best = null;
+    for (const h of history) if (!best || Math.abs(h.t - t) < Math.abs(best.t - t)) best = h;
+    if (!best) return "";
+    const ago = now - best.t;
+    return `<div>${ago < 0.5 ? "now" : `${ago.toFixed(1)} s ago`}</div>` + cs.map(c => {
+      const v = best.byId[c.id];
+      return `<div class="row"><span class="swatch" style="background:${colorOf(c.id)}"></span>${esc(c.name)}: median ${v && v.p50 != null ? fmtNs(v.p50) : "–"}, p99 ${v && v.p99 != null ? fmtNs(v.p99) : "–"}</div>`;
+    }).join("");
+  }, true);
+}
+
+// crosshair + tooltip; px is in viewBox units
+function hover(wrap, svg, tip, html, crosshair) {
+  svg.onmousemove = e => {
+    const r = svg.getBoundingClientRect();
+    const px = ((e.clientX - r.left) / r.width) * W;
+    if (px < M.l || px > M.l + iw) { tip.style.display = "none"; return; }
+    const body = html(px);
+    if (!body) { tip.style.display = "none"; return; }
+    tip.innerHTML = body;
+    tip.style.display = "block";
+    const wr = wrap.getBoundingClientRect();
+    let left = e.clientX - wr.left + 14;
+    if (left + tip.offsetWidth > wr.width) left = e.clientX - wr.left - tip.offsetWidth - 14;
+    tip.style.left = `${Math.max(0, left)}px`;
+    tip.style.top = `${Math.max(0, e.clientY - wr.top - tip.offsetHeight - 10)}px`;
+    let ch = svg.querySelector(".crosshair");
+    if (!ch) { ch = document.createElementNS("http://www.w3.org/2000/svg", "line"); ch.setAttribute("class", "crosshair"); svg.appendChild(ch); }
+    ch.setAttribute("x1", px); ch.setAttribute("x2", px); ch.setAttribute("y1", M.t); ch.setAttribute("y2", M.t + ih);
+    ch.setAttribute("stroke", "var(--axis)"); ch.setAttribute("stroke-width", "1");
+  };
+  svg.onmouseleave = () => { tip.style.display = "none"; const ch = svg.querySelector(".crosshair"); if (ch) ch.remove(); };
+}
+
+function renderTable(s) {
+  const head = ["Contestant", "Races won", "Win %", "Fills", "First-in-line", "Fills/s", "Median", "p99", "p99.9", "Extra latency"];
+  const rows = s.contestants.map(c => [esc(c.name), fmtInt(c.wins), pct(c.wins, c.races).toFixed(1) + "%", fmtInt(c.fills),
+    fmtInt(c.first_fills), fillRate(c.id).toFixed(1), fmtNs(c.p50), fmtNs(c.p99), fmtNs(c.p999), fmtUs(c.extra_ns / 1000)]);
+  $("table").innerHTML = `<tr>${head.map(h => `<th>${h}</th>`).join("")}</tr>` +
+    rows.map(r => `<tr>${r.map(v => `<td class="num">${v}</td>`).join("")}</tr>`).join("");
+}
+
+function esc(s) { return String(s).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch])); }
+
+function update(s) {
+  lastSnap = s;
+  remember(s);
+  renderHeader(s);
+  renderHero(s);
+  renderCards(s);
+  renderHist(s);
+  renderTime(s);
+  renderTable(s);
+}
+
+$("reset").onclick = () => { fetch("/control?reset=1"); history = []; };
+
+// live feed: Server-Sent Events, falling back to polling
+function connect() {
+  if (!window.EventSource) return poll();
+  const es = new EventSource("/events");
+  es.onmessage = e => { try { update(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+  es.onerror = () => {
+    $("status").className = "pill"; $("status-text").textContent = "disconnected – retrying";
+  };
+}
+function poll() { fetch("/snapshot").then(r => r.json()).then(update).catch(() => {}).finally(() => setTimeout(poll, 250)); }
+connect();
+</script>
+</body>
+</html>

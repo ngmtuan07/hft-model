@@ -20,6 +20,7 @@ make test       # matching-engine unit tests
 make verify     # replay a day with no contestants, compare against LOBSTER's own book
 make bench      # matching-engine throughput and per-message latency
 make race       # exchange + two CPU contestants (one with a 20 µs handicap) on this machine
+./scripts/demo.sh   # live demo: two identical CPU contestants on AAPL, scoreboard at http://localhost:8080
 ```
 
 `scripts/race.sh` is configured with environment variables: `MSG` (LOBSTER message file),
@@ -33,6 +34,24 @@ handicap per contestant), `OUT`, and `ORDER_LOG=1` for a per-order CSV. Outputs:
 ./build/trader --name cpu --exchange 127.0.0.1:9000 [--delay-ns 0] [--qty 100] [--max-pos 500]
                [--keep-ticks 1] [--core N]
 ```
+
+## Live scoreboard (`ui/scoreboard.html`, `include/http.hpp`)
+
+Start the exchange with `--http 8080` (or run `./scripts/demo.sh`) and open http://localhost:8080.
+It shows:
+
+* **Races won.** The headline is a share bar for all contested races plus a bar for the last 100 races. Each contestant keeps its color and side.
+* **Per contestant:** races won, median and p99 reaction time, orders filled, fills per second (10 s rolling) and first-in-line fills.
+* **Latency distribution:** each contestant's share of reactions per log-scale bin (100 ns to 10 ms), with p50 and p99 markers.
+* **Latency over time:** rolling 1 s median and p99 for the last 90 s, on a log scale.
+* **Extra latency slider** per contestant (0 µs to 5 ms). The exchange holds that contestant's orders for the chosen time before
+  matching, like adding cable length. It works the same for a CPU or FPGA contestant, and the races and latency it records include the delay.
+* **Reset stats** and a table view.
+
+The page is one self-contained file: no external libraries or fonts, so it works offline. It follows the system light/dark
+setting. Data comes over Server-Sent Events (`/events`), with `/snapshot` polling as a fallback. Control is
+`/control?c=<id>&extra_us=<n>` and `/control?reset=1`. The web server runs on its own threads. The trading loop only publishes a
+snapshot string every 200 ms and reads the slider values.
 
 ## Wire protocol (`include/proto.hpp`)
 
